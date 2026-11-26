@@ -40,9 +40,12 @@ struct SharedConfig {
     // In-game FPS overlay
     volatile LONG overlay_enabled = 1;
     volatile LONG overlay_corner = static_cast<LONG>(OverlayCorner::TopLeft);
+    volatile LONG preview_enabled = 1;
 
     // Incremented by hotkey/UI to cycle through candidate depth buffers
     volatile LONG cycle_depth_seq = 0;
+    // Incremented when depth_recorder.exe exits so injected hook DLLs unload cleanly
+    volatile LONG unload_seq = 0;
 
     // Live telemetry written by hook
     volatile LONG hooked_pid = 0;

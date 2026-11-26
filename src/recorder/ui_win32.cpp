@@ -1,5 +1,7 @@
 #include "ui_win32.h"
 #include "injector.h"
+#include <algorithm>
+#include <cmath>
 #include <commctrl.h>
 #include <commdlg.h>
 #include <shlobj.h>
@@ -29,6 +31,13 @@ enum ControlId : int {
     IDC_HK_RECORD = 117,
     IDC_HK_CYCLE = 118,
     IDC_BTN_APPLY_HK = 119,
+    IDC_EDIT_ZNEAR = 120,
+    IDC_EDIT_ZFAR = 121,
+    IDC_PREVIEW_BOX = 122,
+    IDC_CHK_PREVIEW = 123,
+    IDC_SLIDER_ZNEAR = 124,
+    IDC_SLIDER_ZFAR = 125,
+    IDC_BTN_AUTOCONFIG = 126,
 };
 
 constexpr int kHotkeyRecordId = 1;
@@ -44,6 +53,7 @@ struct UiContext {
     std::vector<HWND> settings_ctrls;
     UINT rec_mod = 0;
     UINT cyc_mod = 0;
+    LONG last_auto_backend = 0;
 };
 
 void populate_processes(UiContext* ctx) {
@@ -78,6 +88,84 @@ UINT hk_mods_to_win32(BYTE hk_mods) {
     return m;
 }
 
+float slider_to_znear(int pos) {
+    const float t = static_cast<float>(pos) / 1000.0f;
+    return 0.01f * std::pow(1000.0f, t); // [0.01, 10.0]
+}
+
+int znear_to_slider(float zn) {
+    zn = std::clamp(zn, 0.01f, 10.0f);
+    return static_cast<int>(std::lround(1000.0f * (std::log10(zn / 0.01f) / 3.0f)));
+}
+
+float slider_to_zfar(int pos) {
+    const float t = static_cast<float>(pos) / 1000.0f;
+    return 10.0f * std::pow(1000.0f, t); // [10.0, 10000.0]
+}
+
+int zfar_to_slider(float zf) {
+    zf = std::clamp(zf, 10.0f, 10000.0f);
+    return static_cast<int>(std::lround(1000.0f * (std::log10(zf / 10.0f) / 3.0f)));
+}
+
+void set_z_controls(HWND hwnd, float zn, float zf) {
+    wchar_t buf[32]{};
+    swprintf_s(buf, L"%.3f", zn);
+    SetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_ZNEAR), buf);
+    SendMessageW(GetDlgItem(hwnd, IDC_SLIDER_ZNEAR), TBM_SETPOS, TRUE, znear_to_slider(zn));
+
+    swprintf_s(buf, L"%.1f", zf);
+    SetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_ZFAR), buf);
+    SendMessageW(GetDlgItem(hwnd, IDC_SLIDER_ZFAR), TBM_SETPOS, TRUE, zfar_to_slider(zf));
+}
+
+void sync_ui_to_config(UiContext* ctx);
+
+void run_auto_config(UiContext* ctx, bool initial_attach) {
+    auto* cfg = ctx->app->config_view.get();
+    const LONG backend = cfg ? cfg->active_backend : 0;
+    const bool is_gl = (backend == 2);
+    const bool rev_z = !is_gl;
+
+    float zn = is_gl ? 0.5f : 0.1f;
+    float zf = is_gl ? 150.0f : 500.0f;
+
+    if (!initial_attach && cfg) {
+        zn = cfg->z_near;
+        zf = cfg->z_far;
+        std::vector<uint8_t> lumas;
+        {
+            std::lock_guard lock(ctx->app->preview_mutex);
+            if (!ctx->app->preview_bgra.empty()) {
+                const size_t n = ctx->app->preview_bgra.size() / 4;
+                const size_t step = std::max<size_t>(1, n / 2048);
+                lumas.reserve(n / step + 1);
+                for (size_t i = 0; i < n; i += step) {
+                    lumas.push_back(ctx->app->preview_bgra[i * 4 + 2]);
+                }
+            }
+        }
+        if (lumas.size() >= 64) {
+            std::sort(lumas.begin(), lumas.end());
+            const uint8_t p15 = lumas[lumas.size() * 15 / 100];
+            const uint8_t p50 = lumas[lumas.size() / 2];
+            const uint8_t p85 = lumas[lumas.size() * 85 / 100];
+            // Adjust Z-Near / Z-Far empirically if the depth histogram is crushed black or washed white
+            if (p50 > 215 && p15 > 150) {
+                zf = std::clamp(zf * 0.45f, 15.0f, 10000.0f);
+                zn = std::clamp(zn * 1.5f, 0.01f, 5.0f);
+            } else if (p50 < 40 && p85 < 100) {
+                zf = std::clamp(zf * 2.2f, 15.0f, 10000.0f);
+            }
+        }
+    }
+
+    CheckDlgButton(ctx->hwnd, IDC_CHK_LINEAR, BST_CHECKED);
+    CheckDlgButton(ctx->hwnd, IDC_CHK_REVZ, rev_z ? BST_CHECKED : BST_UNCHECKED);
+    set_z_controls(ctx->hwnd, zn, zf);
+    sync_ui_to_config(ctx);
+}
+
 void sync_ui_to_config(UiContext* ctx) {
     SharedConfig* cfg = ctx->app->config_view.get();
     if (!cfg) return;
@@ -90,14 +178,33 @@ void sync_ui_to_config(UiContext* ctx) {
     if (mode_idx >= 0 && mode_idx <= 2) {
         InterlockedExchange(&cfg->depth_mode, static_cast<LONG>(mode_idx));
     }
-    InterlockedExchange(&cfg->depth_enabled, IsDlgButtonChecked(ctx->hwnd, IDC_CHK_DEPTH) == BST_CHECKED ? 1 : 0);
+    const bool depth_en = (IsDlgButtonChecked(ctx->hwnd, IDC_CHK_DEPTH) == BST_CHECKED);
+    const bool prev_en = (IsDlgButtonChecked(ctx->hwnd, IDC_CHK_PREVIEW) == BST_CHECKED);
+    InterlockedExchange(&cfg->depth_enabled, depth_en ? 1 : 0);
     InterlockedExchange(&cfg->linearize, IsDlgButtonChecked(ctx->hwnd, IDC_CHK_LINEAR) == BST_CHECKED ? 1 : 0);
     InterlockedExchange(&cfg->reversed_z, IsDlgButtonChecked(ctx->hwnd, IDC_CHK_REVZ) == BST_CHECKED ? 1 : 0);
     InterlockedExchange(&cfg->overlay_enabled, IsDlgButtonChecked(ctx->hwnd, IDC_CHK_OVERLAY) == BST_CHECKED ? 1 : 0);
+    InterlockedExchange(&cfg->preview_enabled, (depth_en && prev_en) ? 1 : 0);
+    if (!depth_en || !prev_en) {
+        std::lock_guard lock(ctx->app->preview_mutex);
+        ctx->app->preview_bgra.clear();
+    }
 
     const LRESULT corner_idx = SendMessageW(GetDlgItem(ctx->hwnd, IDC_CORNER_COMBO), CB_GETCURSEL, 0, 0);
     if (corner_idx >= 0 && corner_idx <= 3) {
         InterlockedExchange(&cfg->overlay_corner, static_cast<LONG>(corner_idx));
+    }
+
+    wchar_t zbuf[32]{};
+    GetWindowTextW(GetDlgItem(ctx->hwnd, IDC_EDIT_ZNEAR), zbuf, 32);
+    if (zbuf[0]) {
+        const float zn = static_cast<float>(_wtof(zbuf));
+        if (zn > 0.0f) cfg->z_near = zn;
+    }
+    GetWindowTextW(GetDlgItem(ctx->hwnd, IDC_EDIT_ZFAR), zbuf, 32);
+    if (zbuf[0]) {
+        const float zf = static_cast<float>(_wtof(zbuf));
+        if (zf > cfg->z_near) cfg->z_far = zf;
     }
 }
 
@@ -151,7 +258,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
             ctx->font = CreateFontIndirectW(&ncm.lfMessageFont);
 
-            HWND tab = add_ctrl(hwnd, ctx->font, WC_TABCONTROLW, L"", 0, 8, 6, 614, 218, IDC_TAB_MAIN);
+            HWND tab = add_ctrl(hwnd, ctx->font, WC_TABCONTROLW, L"", 0, 8, 6, 614, 276, IDC_TAB_MAIN);
             TCITEMW tie{};
             tie.mask = TCIF_TEXT;
             tie.pszText = const_cast<wchar_t*>(L"Capture");
@@ -203,9 +310,23 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SendMessageW(c3, BM_SETCHECK, BST_CHECKED, 0);
             SendMessageW(c4, BM_SETCHECK, BST_CHECKED, 0);
 
-            cap(L"BUTTON", L"Start Recording (F9)", BS_DEFPUSHBUTTON, 12, 148, 295, 32, IDC_BTN_RECORD);
-            cap(L"BUTTON", L"Cycle Depth Buffer (F10)", 0, 321, 148, 295, 32, IDC_BTN_CYCLE_DEPTH);
-            add_ctrl(hwnd, ctx->font, L"STATIC", L"State: Idle", SS_SUNKEN, 12, 230, 604, 24, IDC_LBL_STATUS);
+            cap(L"STATIC", L"Z-Near:", 0, 12, 146, 52, 20, 0);
+            cap(L"EDIT", L"0.100", WS_BORDER | ES_AUTOHSCROLL, 66, 143, 80, 22, IDC_EDIT_ZNEAR);
+            HWND s_zn = cap(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_NOTICKS, 12, 168, 190, 24, IDC_SLIDER_ZNEAR);
+            SendMessageW(s_zn, TBM_SETRANGE, TRUE, MAKELONG(0, 1000));
+            SendMessageW(s_zn, TBM_SETPOS, TRUE, znear_to_slider(0.1f));
+
+            cap(L"STATIC", L"Z-Far:", 0, 220, 146, 46, 20, 0);
+            cap(L"EDIT", L"500.0", WS_BORDER | ES_AUTOHSCROLL, 268, 143, 86, 22, IDC_EDIT_ZFAR);
+            HWND s_zf = cap(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_NOTICKS, 220, 168, 190, 24, IDC_SLIDER_ZFAR);
+            SendMessageW(s_zf, TBM_SETRANGE, TRUE, MAKELONG(0, 1000));
+            SendMessageW(s_zf, TBM_SETPOS, TRUE, zfar_to_slider(500.0f));
+
+            cap(L"BUTTON", L"Auto Config", 0, 424, 148, 192, 34, IDC_BTN_AUTOCONFIG);
+
+            cap(L"BUTTON", L"Start Recording (F9)", BS_DEFPUSHBUTTON, 12, 202, 295, 32, IDC_BTN_RECORD);
+            cap(L"BUTTON", L"Cycle Depth Buffer (F10)", 0, 321, 202, 295, 32, IDC_BTN_CYCLE_DEPTH);
+            add_ctrl(hwnd, ctx->font, L"STATIC", L"State: Idle", SS_SUNKEN, 12, 288, 604, 24, IDC_LBL_STATUS);
 
             // Settings tab controls
             set(L"STATIC", L"Record Toggle Keybind:", 0, 20, 24, 160, 20, 0);
@@ -216,13 +337,38 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             HWND hk_cyc = set(HOTKEY_CLASSW, L"", WS_BORDER, 190, 60, 200, 24, IDC_HK_CYCLE);
             SendMessageW(hk_cyc, HKM_SETHOTKEY, MAKEWORD(ctx->app->hotkey_cycle_vk, 0), 0);
 
-            set(L"BUTTON", L"Apply Keybinds", 0, 190, 100, 200, 28, IDC_BTN_APPLY_HK);
+            HWND c_prev = set(L"BUTTON", L"Live Depth Preview", BS_AUTOCHECKBOX, 190, 96, 160, 22, IDC_CHK_PREVIEW);
+            SendMessageW(c_prev, BM_SETCHECK, BST_CHECKED, 0);
+
+            set(L"BUTTON", L"Apply Keybinds", 0, 190, 128, 200, 28, IDC_BTN_APPLY_HK);
+
+            add_ctrl(hwnd, ctx->font, L"STATIC", L"Depth Preview:", 0, 632, 8, 240, 18, 0);
+            add_ctrl(hwnd, ctx->font, L"STATIC", L"", SS_OWNERDRAW | WS_BORDER, 632, 30, 240, 240, IDC_PREVIEW_BOX);
             switch_tab(ctx, 0);
 
             populate_processes(ctx);
             RegisterHotKey(hwnd, kHotkeyRecordId, 0, ctx->app->hotkey_record_vk);
             RegisterHotKey(hwnd, kHotkeyCycleId, 0, ctx->app->hotkey_cycle_vk);
             SetTimer(hwnd, kTimerId, 200, nullptr);
+            return 0;
+        }
+        case WM_HSCROLL: {
+            HWND src = reinterpret_cast<HWND>(lp);
+            if (src == GetDlgItem(hwnd, IDC_SLIDER_ZNEAR)) {
+                const int pos = static_cast<int>(SendMessageW(src, TBM_GETPOS, 0, 0));
+                const float zn = slider_to_znear(pos);
+                wchar_t buf[32]{};
+                swprintf_s(buf, L"%.3f", zn);
+                SetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_ZNEAR), buf);
+                sync_ui_to_config(ctx);
+            } else if (src == GetDlgItem(hwnd, IDC_SLIDER_ZFAR)) {
+                const int pos = static_cast<int>(SendMessageW(src, TBM_GETPOS, 0, 0));
+                const float zf = slider_to_zfar(pos);
+                wchar_t buf[32]{};
+                swprintf_s(buf, L"%.1f", zf);
+                SetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_ZFAR), buf);
+                sync_ui_to_config(ctx);
+            }
             return 0;
         }
         case WM_NOTIFY: {
@@ -278,6 +424,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             } else if (id == IDC_BTN_CYCLE_DEPTH) {
                 if (auto* cfg = ctx->app->config_view.get()) InterlockedIncrement(&cfg->cycle_depth_seq);
             } else if (id == IDC_BTN_APPLY_HK) {
+                sync_ui_to_config(ctx);
                 const LRESULT r_hk = SendMessageW(GetDlgItem(hwnd, IDC_HK_RECORD), HKM_GETHOTKEY, 0, 0);
                 const LRESULT c_hk = SendMessageW(GetDlgItem(hwnd, IDC_HK_CYCLE), HKM_GETHOTKEY, 0, 0);
                 if (LOWORD(r_hk) != 0) {
@@ -292,9 +439,16 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     ctx->cyc_mod = hk_mods_to_win32(HIBYTE(LOWORD(c_hk)));
                     RegisterHotKey(hwnd, kHotkeyCycleId, ctx->cyc_mod, ctx->app->hotkey_cycle_vk);
                 }
+            } else if (id == IDC_BTN_AUTOCONFIG) {
+                run_auto_config(ctx, false);
+            } else if ((id == IDC_EDIT_ZNEAR || id == IDC_EDIT_ZFAR) && code == EN_KILLFOCUS) {
+                sync_ui_to_config(ctx);
+                if (auto* cfg = ctx->app->config_view.get()) {
+                    set_z_controls(hwnd, cfg->z_near, cfg->z_far);
+                }
             } else if (id == IDC_MODE_COMBO || id == IDC_CORNER_COMBO ||
                        id == IDC_CHK_DEPTH || id == IDC_CHK_LINEAR ||
-                       id == IDC_CHK_REVZ || id == IDC_CHK_OVERLAY) {
+                       id == IDC_CHK_REVZ || id == IDC_CHK_OVERLAY || id == IDC_CHK_PREVIEW) {
                 sync_ui_to_config(ctx);
             }
             return 0;
@@ -306,8 +460,40 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         }
+        case WM_DRAWITEM: {
+            auto* dis = reinterpret_cast<DRAWITEMSTRUCT*>(lp);
+            if (dis->CtlID == IDC_PREVIEW_BOX && ctx && ctx->app) {
+                std::lock_guard lock(ctx->app->preview_mutex);
+                if (!ctx->app->preview_bgra.empty() && ctx->app->preview_w > 0 && ctx->app->preview_h > 0) {
+                    BITMAPINFO bmi{};
+                    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                    bmi.bmiHeader.biWidth = static_cast<LONG>(ctx->app->preview_w);
+                    bmi.bmiHeader.biHeight = -static_cast<LONG>(ctx->app->preview_h);
+                    bmi.bmiHeader.biPlanes = 1;
+                    bmi.bmiHeader.biBitCount = 32;
+                    bmi.bmiHeader.biCompression = BI_RGB;
+                    SetStretchBltMode(dis->hDC, COLORONCOLOR);
+                    StretchDIBits(dis->hDC, 0, 0, dis->rcItem.right - dis->rcItem.left, dis->rcItem.bottom - dis->rcItem.top,
+                                  0, 0, static_cast<int>(ctx->app->preview_w), static_cast<int>(ctx->app->preview_h),
+                                  ctx->app->preview_bgra.data(), &bmi, DIB_RGB_COLORS, SRCCOPY);
+                } else {
+                    FillRect(dis->hDC, &dis->rcItem, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+                }
+                return TRUE;
+            }
+            return FALSE;
+        }
         case WM_TIMER: {
+            if (auto* cfg = ctx->app->config_view.get()) {
+                if (cfg->active_backend != 0 && cfg->active_backend != ctx->last_auto_backend) {
+                    ctx->last_auto_backend = cfg->active_backend;
+                    run_auto_config(ctx, true);
+                }
+            }
             update_status(ctx);
+            if (HWND pv = GetDlgItem(hwnd, IDC_PREVIEW_BOX)) {
+                InvalidateRect(pv, nullptr, FALSE);
+            }
             return 0;
         }
         case WM_DESTROY: {
@@ -326,7 +512,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 } // namespace
 
 int run_win32_ui(HINSTANCE hInstance, RecorderAppState& app) {
-    INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_STANDARD_CLASSES | ICC_TAB_CLASSES | ICC_HOTKEY_CLASS};
+    INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_STANDARD_CLASSES | ICC_TAB_CLASSES | ICC_HOTKEY_CLASS | ICC_BAR_CLASSES};
     InitCommonControlsEx(&icc);
 
     WNDCLASSEXW wc{sizeof(wc)};
@@ -341,7 +527,7 @@ int run_win32_ui(HINSTANCE hInstance, RecorderAppState& app) {
     HWND hwnd = CreateWindowExW(
         0, wc.lpszClassName, L"Depth Recorder (Portable)",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 645, 300,
+        CW_USEDEFAULT, CW_USEDEFAULT, 895, 355,
         nullptr, nullptr, hInstance, &ctx);
     if (!hwnd) return 1;
 

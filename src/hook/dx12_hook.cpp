@@ -955,7 +955,7 @@ void dx12_on_present(IDXGISwapChain* swap) {
         }
     }
 
-    const bool recording = (cfg && cfg->recording != 0 && g_ipc_ring.event_handle());
+    const bool recording = (cfg && (cfg->recording != 0 || cfg->preview_enabled != 0) && g_ipc_ring.event_handle());
     const bool overlay = (cfg && cfg->overlay_enabled != 0);
 
     if (recording) {

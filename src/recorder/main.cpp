@@ -40,6 +40,31 @@ void consumer_loop(dr::RecorderAppState& app, uint64_t max_frames) {
             } else if (app.encoder.is_running()) {
                 app.encoder.stop();
             }
+
+            if (hdr.has_depth && hdr.width > 0 && hdr.height > 0 && (hdr.frame_index % 6 == 0)) {
+                const uint8_t* d = payload + hdr.color_bytes;
+                const size_t px_count = static_cast<size_t>(hdr.width) * hdr.height;
+                std::lock_guard lock(app.preview_mutex);
+                app.preview_w = hdr.width;
+                app.preview_h = hdr.height;
+                app.preview_bgra.resize(px_count * 4);
+                if (hdr.depth_mode == static_cast<uint32_t>(dr::DepthMode::Gray8)) {
+                    for (size_t i = 0; i < px_count; ++i) {
+                        const uint8_t v = d[i];
+                        app.preview_bgra[i * 4 + 0] = v;
+                        app.preview_bgra[i * 4 + 1] = v;
+                        app.preview_bgra[i * 4 + 2] = v;
+                        app.preview_bgra[i * 4 + 3] = 255;
+                    }
+                } else {
+                    for (size_t i = 0; i < px_count; ++i) {
+                        app.preview_bgra[i * 4 + 0] = d[i * 4 + 2]; // B
+                        app.preview_bgra[i * 4 + 1] = d[i * 4 + 1]; // G
+                        app.preview_bgra[i * 4 + 2] = d[i * 4 + 0]; // R
+                        app.preview_bgra[i * 4 + 3] = 255;
+                    }
+                }
+            }
             app.ring.release_pop();
 
             if (max_frames > 0 && app.encoder.frames_written() >= max_frames) {
@@ -126,6 +151,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
 
     std::thread consumer(consumer_loop, std::ref(app), 0);
     const int rc = dr::run_win32_ui(hInstance, app);
+    if (auto* cfg = app.config_view.get()) {
+        InterlockedExchange(&cfg->recording, 0);
+        InterlockedExchange(&cfg->preview_enabled, 0);
+        InterlockedIncrement(&cfg->unload_seq);
+        Sleep(150);
+    }
     app.running.store(false);
     consumer.join();
     return rc;

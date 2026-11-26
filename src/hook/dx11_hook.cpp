@@ -561,7 +561,7 @@ HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swap, UINT sync, UINT flags)
                 }
             }
 
-            if (cfg && cfg->recording != 0 && g_ipc_ring.event_handle()) {
+            if (cfg && (cfg->recording != 0 || cfg->preview_enabled != 0) && g_ipc_ring.event_handle()) {
                 capture_frame(swap, cfg, now.QuadPart);
             } else {
                 for (bool& p : g_dx11.slot_pending) p = false;
