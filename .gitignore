@@ -1,0 +1,34 @@
+# Build & CMake artifacts
+build/
+out/
+_deps/
+CMakeUserPresets.json
+
+# Visual Studio / MSVC
+.vs/
+*.user
+*.suo
+*.sln
+*.vcxproj*
+*.pdb
+*.ilk
+*.obj
+*.idb
+*.tlog
+
+# Compiled binaries & shader headers
+*.exe
+*.dll
+*.lib
+*.exp
+generated_shaders/
+
+# Recordings & temporary test outputs
+recordings/
+test_out/
+tmp_*/
+*.mp4
+*.mkv
+*.avi
+*.raw
+*.log
