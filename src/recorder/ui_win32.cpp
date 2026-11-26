@@ -25,6 +25,10 @@ enum ControlId : int {
     IDC_BTN_RECORD = 113,
     IDC_BTN_CYCLE_DEPTH = 114,
     IDC_LBL_STATUS = 115,
+    IDC_TAB_MAIN = 116,
+    IDC_HK_RECORD = 117,
+    IDC_HK_CYCLE = 118,
+    IDC_BTN_APPLY_HK = 119,
 };
 
 constexpr int kHotkeyRecordId = 1;
@@ -36,17 +40,42 @@ struct UiContext {
     HWND hwnd = nullptr;
     HFONT font = nullptr;
     std::vector<ProcessEntry> procs;
+    std::vector<HWND> capture_ctrls;
+    std::vector<HWND> settings_ctrls;
+    UINT rec_mod = 0;
+    UINT cyc_mod = 0;
 };
 
 void populate_processes(UiContext* ctx) {
     HWND combo = GetDlgItem(ctx->hwnd, IDC_PROC_COMBO);
+    DWORD prev_pid = 0;
+    const LRESULT cur = SendMessageW(combo, CB_GETCURSEL, 0, 0);
+    if (cur >= 0 && static_cast<size_t>(cur) < ctx->procs.size()) {
+        prev_pid = ctx->procs[cur].pid;
+    }
     SendMessageW(combo, CB_RESETCONTENT, 0, 0);
     ctx->procs = list_processes();
-    for (const auto& p : ctx->procs) {
+    int sel = 0;
+    for (size_t i = 0; i < ctx->procs.size(); ++i) {
+        const auto& p = ctx->procs[i];
+        if (p.pid == prev_pid) sel = static_cast<int>(i);
         std::wstring label = p.name + L"  (PID " + std::to_wstring(p.pid) + L")";
         SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
     }
-    if (!ctx->procs.empty()) SendMessageW(combo, CB_SETCURSEL, 0, 0);
+    if (!ctx->procs.empty()) SendMessageW(combo, CB_SETCURSEL, sel, 0);
+}
+
+void switch_tab(UiContext* ctx, int tab_idx) {
+    for (HWND h : ctx->capture_ctrls) ShowWindow(h, tab_idx == 0 ? SW_SHOW : SW_HIDE);
+    for (HWND h : ctx->settings_ctrls) ShowWindow(h, tab_idx == 1 ? SW_SHOW : SW_HIDE);
+}
+
+UINT hk_mods_to_win32(BYTE hk_mods) {
+    UINT m = 0;
+    if (hk_mods & HOTKEYF_ALT) m |= MOD_ALT;
+    if (hk_mods & HOTKEYF_CONTROL) m |= MOD_CONTROL;
+    if (hk_mods & HOTKEYF_SHIFT) m |= MOD_SHIFT;
+    return m;
 }
 
 void sync_ui_to_config(UiContext* ctx) {
@@ -122,43 +151,73 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
             ctx->font = CreateFontIndirectW(&ncm.lfMessageFont);
 
-            add_ctrl(hwnd, ctx->font, L"STATIC", L"Target Process:", 0, 12, 14, 100, 20, 0);
-            add_ctrl(hwnd, ctx->font, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 115, 10, 250, 240, IDC_PROC_COMBO);
-            add_ctrl(hwnd, ctx->font, L"BUTTON", L"Refresh", 0, 372, 10, 68, 24, IDC_BTN_REFRESH);
-            add_ctrl(hwnd, ctx->font, L"BUTTON", L"Attach", 0, 446, 10, 68, 24, IDC_BTN_ATTACH);
-            add_ctrl(hwnd, ctx->font, L"BUTTON", L"Launch EXE...", 0, 520, 10, 96, 24, IDC_BTN_LAUNCH);
+            HWND tab = add_ctrl(hwnd, ctx->font, WC_TABCONTROLW, L"", 0, 8, 6, 614, 218, IDC_TAB_MAIN);
+            TCITEMW tie{};
+            tie.mask = TCIF_TEXT;
+            tie.pszText = const_cast<wchar_t*>(L"Capture");
+            TabCtrl_InsertItem(tab, 0, &tie);
+            tie.pszText = const_cast<wchar_t*>(L"Settings");
+            TabCtrl_InsertItem(tab, 1, &tie);
 
-            add_ctrl(hwnd, ctx->font, L"STATIC", L"Output Folder:", 0, 12, 46, 100, 20, 0);
-            add_ctrl(hwnd, ctx->font, L"EDIT", ctx->app->output_dir.c_str(), WS_BORDER | ES_AUTOHSCROLL, 115, 44, 425, 22, IDC_EDIT_OUTDIR);
-            add_ctrl(hwnd, ctx->font, L"BUTTON", L"Browse...", 0, 546, 43, 70, 24, IDC_BTN_BROWSE);
+            auto cap = [&](const wchar_t* cls, const wchar_t* text, DWORD style, int x, int y, int w, int h, int id) {
+                HWND c = add_ctrl(hwnd, ctx->font, cls, text, style, x, y + 26, w, h, id);
+                ctx->capture_ctrls.push_back(c);
+                return c;
+            };
+            auto set = [&](const wchar_t* cls, const wchar_t* text, DWORD style, int x, int y, int w, int h, int id) {
+                HWND c = add_ctrl(hwnd, ctx->font, cls, text, style, x, y + 26, w, h, id);
+                ctx->settings_ctrls.push_back(c);
+                return c;
+            };
 
-            add_ctrl(hwnd, ctx->font, L"STATIC", L"Depth Format:", 0, 12, 80, 100, 20, 0);
-            HWND mode_cb = add_ctrl(hwnd, ctx->font, L"COMBOBOX", L"", CBS_DROPDOWNLIST, 115, 76, 240, 120, IDC_MODE_COMBO);
+            cap(L"STATIC", L"Target Process:", 0, 12, 14, 100, 20, 0);
+            cap(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 115, 10, 324, 240, IDC_PROC_COMBO);
+            cap(L"BUTTON", L"Attach", 0, 446, 10, 68, 24, IDC_BTN_ATTACH);
+            cap(L"BUTTON", L"Launch EXE...", 0, 520, 10, 96, 24, IDC_BTN_LAUNCH);
+
+            cap(L"STATIC", L"Output Folder:", 0, 12, 46, 100, 20, 0);
+            cap(L"EDIT", ctx->app->output_dir.c_str(), WS_BORDER | ES_AUTOHSCROLL, 115, 44, 425, 22, IDC_EDIT_OUTDIR);
+            cap(L"BUTTON", L"Browse...", 0, 546, 43, 70, 24, IDC_BTN_BROWSE);
+
+            cap(L"STATIC", L"Depth Format:", 0, 12, 80, 100, 20, 0);
+            HWND mode_cb = cap(L"COMBOBOX", L"", CBS_DROPDOWNLIST, 115, 76, 240, 120, IDC_MODE_COMBO);
             SendMessageW(mode_cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Gray8 (H.264 MP4)"));
             SendMessageW(mode_cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"ColorPhase (H.264 MP4, Lossy-Safe)"));
             SendMessageW(mode_cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"RGB24 Lossless (UtVideo MKV, 16.7M)"));
             SendMessageW(mode_cb, CB_SETCURSEL, 2, 0);
 
-            add_ctrl(hwnd, ctx->font, L"STATIC", L"Overlay Corner:", 0, 372, 80, 95, 20, 0);
-            HWND corner_cb = add_ctrl(hwnd, ctx->font, L"COMBOBOX", L"", CBS_DROPDOWNLIST, 470, 76, 146, 120, IDC_CORNER_COMBO);
+            cap(L"STATIC", L"Overlay Corner:", 0, 372, 80, 95, 20, 0);
+            HWND corner_cb = cap(L"COMBOBOX", L"", CBS_DROPDOWNLIST, 470, 76, 146, 120, IDC_CORNER_COMBO);
             SendMessageW(corner_cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Top-Left"));
             SendMessageW(corner_cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Top-Right"));
             SendMessageW(corner_cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Bottom-Left"));
             SendMessageW(corner_cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Bottom-Right"));
             SendMessageW(corner_cb, CB_SETCURSEL, 0, 0);
 
-            HWND c1 = add_ctrl(hwnd, ctx->font, L"BUTTON", L"Enable Depth Pass", BS_AUTOCHECKBOX, 12, 114, 135, 22, IDC_CHK_DEPTH);
-            HWND c2 = add_ctrl(hwnd, ctx->font, L"BUTTON", L"Linearize (Gray8/Phase)", BS_AUTOCHECKBOX, 155, 114, 165, 22, IDC_CHK_LINEAR);
-            HWND c3 = add_ctrl(hwnd, ctx->font, L"BUTTON", L"Reversed-Z", BS_AUTOCHECKBOX, 330, 114, 100, 22, IDC_CHK_REVZ);
-            HWND c4 = add_ctrl(hwnd, ctx->font, L"BUTTON", L"In-Game FPS Overlay", BS_AUTOCHECKBOX, 445, 114, 165, 22, IDC_CHK_OVERLAY);
+            HWND c1 = cap(L"BUTTON", L"Enable Depth Pass", BS_AUTOCHECKBOX, 12, 114, 135, 22, IDC_CHK_DEPTH);
+            HWND c2 = cap(L"BUTTON", L"Linearize (Gray8/Phase)", BS_AUTOCHECKBOX, 155, 114, 165, 22, IDC_CHK_LINEAR);
+            HWND c3 = cap(L"BUTTON", L"Reversed-Z", BS_AUTOCHECKBOX, 330, 114, 100, 22, IDC_CHK_REVZ);
+            HWND c4 = cap(L"BUTTON", L"In-Game FPS Overlay", BS_AUTOCHECKBOX, 445, 114, 165, 22, IDC_CHK_OVERLAY);
             SendMessageW(c1, BM_SETCHECK, BST_CHECKED, 0);
             SendMessageW(c2, BM_SETCHECK, BST_CHECKED, 0);
             SendMessageW(c3, BM_SETCHECK, BST_CHECKED, 0);
             SendMessageW(c4, BM_SETCHECK, BST_CHECKED, 0);
 
-            add_ctrl(hwnd, ctx->font, L"BUTTON", L"Start Recording (F9)", BS_DEFPUSHBUTTON, 12, 148, 295, 32, IDC_BTN_RECORD);
-            add_ctrl(hwnd, ctx->font, L"BUTTON", L"Cycle Depth Buffer (F10)", 0, 321, 148, 295, 32, IDC_BTN_CYCLE_DEPTH);
-            add_ctrl(hwnd, ctx->font, L"STATIC", L"State: Idle", SS_SUNKEN, 12, 192, 604, 24, IDC_LBL_STATUS);
+            cap(L"BUTTON", L"Start Recording (F9)", BS_DEFPUSHBUTTON, 12, 148, 295, 32, IDC_BTN_RECORD);
+            cap(L"BUTTON", L"Cycle Depth Buffer (F10)", 0, 321, 148, 295, 32, IDC_BTN_CYCLE_DEPTH);
+            add_ctrl(hwnd, ctx->font, L"STATIC", L"State: Idle", SS_SUNKEN, 12, 230, 604, 24, IDC_LBL_STATUS);
+
+            // Settings tab controls
+            set(L"STATIC", L"Record Toggle Keybind:", 0, 20, 24, 160, 20, 0);
+            HWND hk_rec = set(HOTKEY_CLASSW, L"", WS_BORDER, 190, 20, 200, 24, IDC_HK_RECORD);
+            SendMessageW(hk_rec, HKM_SETHOTKEY, MAKEWORD(ctx->app->hotkey_record_vk, 0), 0);
+
+            set(L"STATIC", L"Cycle Depth Keybind:", 0, 20, 60, 160, 20, 0);
+            HWND hk_cyc = set(HOTKEY_CLASSW, L"", WS_BORDER, 190, 60, 200, 24, IDC_HK_CYCLE);
+            SendMessageW(hk_cyc, HKM_SETHOTKEY, MAKEWORD(ctx->app->hotkey_cycle_vk, 0), 0);
+
+            set(L"BUTTON", L"Apply Keybinds", 0, 190, 100, 200, 28, IDC_BTN_APPLY_HK);
+            switch_tab(ctx, 0);
 
             populate_processes(ctx);
             RegisterHotKey(hwnd, kHotkeyRecordId, 0, ctx->app->hotkey_record_vk);
@@ -166,9 +225,17 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetTimer(hwnd, kTimerId, 200, nullptr);
             return 0;
         }
+        case WM_NOTIFY: {
+            auto* nm = reinterpret_cast<NMHDR*>(lp);
+            if (nm->idFrom == IDC_TAB_MAIN && nm->code == TCN_SELCHANGE) {
+                switch_tab(ctx, TabCtrl_GetCurSel(nm->hwndFrom));
+            }
+            return 0;
+        }
         case WM_COMMAND: {
             const int id = LOWORD(wp);
-            if (id == IDC_BTN_REFRESH) {
+            const int code = HIWORD(wp);
+            if (id == IDC_PROC_COMBO && code == CBN_DROPDOWN) {
                 populate_processes(ctx);
             } else if (id == IDC_BTN_ATTACH) {
                 const LRESULT idx = SendMessageW(GetDlgItem(hwnd, IDC_PROC_COMBO), CB_GETCURSEL, 0, 0);
@@ -210,6 +277,21 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 toggle_recording(ctx);
             } else if (id == IDC_BTN_CYCLE_DEPTH) {
                 if (auto* cfg = ctx->app->config_view.get()) InterlockedIncrement(&cfg->cycle_depth_seq);
+            } else if (id == IDC_BTN_APPLY_HK) {
+                const LRESULT r_hk = SendMessageW(GetDlgItem(hwnd, IDC_HK_RECORD), HKM_GETHOTKEY, 0, 0);
+                const LRESULT c_hk = SendMessageW(GetDlgItem(hwnd, IDC_HK_CYCLE), HKM_GETHOTKEY, 0, 0);
+                if (LOWORD(r_hk) != 0) {
+                    UnregisterHotKey(hwnd, kHotkeyRecordId);
+                    ctx->app->hotkey_record_vk = LOBYTE(LOWORD(r_hk));
+                    ctx->rec_mod = hk_mods_to_win32(HIBYTE(LOWORD(r_hk)));
+                    RegisterHotKey(hwnd, kHotkeyRecordId, ctx->rec_mod, ctx->app->hotkey_record_vk);
+                }
+                if (LOWORD(c_hk) != 0) {
+                    UnregisterHotKey(hwnd, kHotkeyCycleId);
+                    ctx->app->hotkey_cycle_vk = LOBYTE(LOWORD(c_hk));
+                    ctx->cyc_mod = hk_mods_to_win32(HIBYTE(LOWORD(c_hk)));
+                    RegisterHotKey(hwnd, kHotkeyCycleId, ctx->cyc_mod, ctx->app->hotkey_cycle_vk);
+                }
             } else if (id == IDC_MODE_COMBO || id == IDC_CORNER_COMBO ||
                        id == IDC_CHK_DEPTH || id == IDC_CHK_LINEAR ||
                        id == IDC_CHK_REVZ || id == IDC_CHK_OVERLAY) {
@@ -244,7 +326,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 } // namespace
 
 int run_win32_ui(HINSTANCE hInstance, RecorderAppState& app) {
-    INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_STANDARD_CLASSES};
+    INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_STANDARD_CLASSES | ICC_TAB_CLASSES | ICC_HOTKEY_CLASS};
     InitCommonControlsEx(&icc);
 
     WNDCLASSEXW wc{sizeof(wc)};
@@ -259,7 +341,7 @@ int run_win32_ui(HINSTANCE hInstance, RecorderAppState& app) {
     HWND hwnd = CreateWindowExW(
         0, wc.lpszClassName, L"Depth Recorder (Portable)",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 645, 265,
+        CW_USEDEFAULT, CW_USEDEFAULT, 645, 300,
         nullptr, nullptr, hInstance, &ctx);
     if (!hwnd) return 1;
 

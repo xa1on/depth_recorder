@@ -21,11 +21,17 @@ if(NOT minhook_POPULATED)
     FetchContent_Populate(minhook)
 endif()
 
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    set(MINHOOK_HDE_SRC "${minhook_SOURCE_DIR}/src/hde/hde32.c")
+else()
+    set(MINHOOK_HDE_SRC "${minhook_SOURCE_DIR}/src/hde/hde64.c")
+endif()
+
 add_library(minhook STATIC
     "${minhook_SOURCE_DIR}/src/buffer.c"
     "${minhook_SOURCE_DIR}/src/hook.c"
     "${minhook_SOURCE_DIR}/src/trampoline.c"
-    "${minhook_SOURCE_DIR}/src/hde/hde64.c"
+    "${MINHOOK_HDE_SRC}"
 )
 target_include_directories(minhook PUBLIC "${minhook_SOURCE_DIR}/include")
 
@@ -103,6 +109,10 @@ target_include_directories(depth_hook PRIVATE
     "${minhook_SOURCE_DIR}/include"
 )
 target_link_libraries(depth_hook PRIVATE minhook d3d11 d3d12 dxgi opengl32)
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    set_target_properties(depth_hook PROPERTIES OUTPUT_NAME "depth_hook32")
+    add_executable(inject32 src/recorder/inject32_main.cpp)
+endif()
 
 # 2. Portable Win32 + CLI recorder & launcher
 add_executable(depth_recorder WIN32

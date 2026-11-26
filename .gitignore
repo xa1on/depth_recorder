@@ -1,5 +1,6 @@
 # Build & CMake artifacts
 build/
+build32/
 out/
 _deps/
 CMakeUserPresets.json

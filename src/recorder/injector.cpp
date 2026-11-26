@@ -32,15 +32,24 @@ bool is_compatible_process(DWORD pid, DWORD self_pid) {
     if (!proc) return false;
 
     BOOL is_wow64 = FALSE;
-    if (!IsWow64Process(proc, &is_wow64) || is_wow64) {
+    if (!IsWow64Process(proc, &is_wow64)) {
         CloseHandle(proc);
-        return false; // 32-bit process cannot load 64-bit depth_hook.dll
+        return false;
+    }
+    if (is_wow64) {
+        wchar_t exe_dir[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, exe_dir, MAX_PATH);
+        const auto p32 = std::filesystem::path(exe_dir).parent_path() / L"depth_hook32.dll";
+        if (!std::filesystem::exists(p32)) {
+            CloseHandle(proc);
+            return false;
+        }
     }
 
     HMODULE mods[256]{};
     DWORD needed = 0;
     bool has_gfx = false;
-    if (EnumProcessModules(proc, mods, sizeof(mods), &needed)) {
+    if (EnumProcessModulesEx(proc, mods, sizeof(mods), &needed, LIST_MODULES_ALL)) {
         const DWORD count = std::min<DWORD>(needed / sizeof(HMODULE), 256);
         wchar_t mod_name[MAX_PATH]{};
         for (DWORD i = 0; i < count; ++i) {
@@ -91,6 +100,32 @@ bool inject_dll(DWORD pid, const std::wstring& dll_path, std::wstring* out_error
     if (!proc) {
         if (out_error) *out_error = format_win32_error(L"OpenProcess", GetLastError());
         return false;
+    }
+
+    BOOL is_wow64 = FALSE;
+    if (IsWow64Process(proc, &is_wow64) && is_wow64) {
+        CloseHandle(proc);
+        const auto dir = std::filesystem::path(dll_path).parent_path();
+        const auto inj32 = dir / L"inject32.exe";
+        const auto dll32 = dir / L"depth_hook32.dll";
+        if (!std::filesystem::exists(inj32) || !std::filesystem::exists(dll32)) {
+            if (out_error) *out_error = L"32-bit target requires inject32.exe and depth_hook32.dll next to depth_recorder.exe.";
+            return false;
+        }
+        std::wstring cmd = L"\"" + inj32.wstring() + L"\" " + std::to_wstring(pid) + L" \"" + dll32.wstring() + L"\"";
+        STARTUPINFOW si{sizeof(si)};
+        PROCESS_INFORMATION pi{};
+        if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+            if (out_error) *out_error = format_win32_error(L"inject32.exe", GetLastError());
+            return false;
+        }
+        WaitForSingleObject(pi.hProcess, 6000);
+        DWORD rc = 1;
+        GetExitCodeProcess(pi.hProcess, &rc);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        if (rc != 0 && out_error) *out_error = format_win32_error(L"inject32", rc);
+        return rc == 0;
     }
 
     const size_t bytes = (dll_path.size() + 1) * sizeof(wchar_t);

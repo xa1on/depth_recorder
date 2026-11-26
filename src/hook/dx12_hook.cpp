@@ -56,6 +56,7 @@ using PFN_CopyDescriptors = void(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, const 
 using PFN_CopyDescriptorsSimple = void(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_DESCRIPTOR_HEAP_TYPE);
 using PFN_OMSetRenderTargets = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL, const D3D12_CPU_DESCRIPTOR_HANDLE*);
 using PFN_ClearDepthStencilView = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CLEAR_FLAGS, FLOAT, UINT8, UINT, const D3D12_RECT*);
+using PFN_ResourceBarrier = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*);
 
 PFN_ExecuteCommandLists oExecuteCommandLists = nullptr;
 PFN_CreateDescriptorHeap oCreateDescriptorHeap = nullptr;
@@ -64,9 +65,12 @@ PFN_CopyDescriptors oCopyDescriptors = nullptr;
 PFN_CopyDescriptorsSimple oCopyDescriptorsSimple = nullptr;
 PFN_OMSetRenderTargets oOMSetRenderTargets = nullptr;
 PFN_ClearDepthStencilView oClearDepthStencilView = nullptr;
+PFN_ResourceBarrier oResourceBarrier = nullptr;
 
 std::recursive_mutex g_mutex;
+std::mutex g_track_mutex;
 std::unordered_map<SIZE_T, DsvEntry> g_dsv_map;
+std::unordered_map<ID3D12Resource*, D3D12_RESOURCE_STATES> g_res_state;
 std::unordered_map<uintptr_t, ComPtr<ID3D12Resource>> g_known_depth_res;
 
 struct Dx12State {
@@ -551,12 +555,19 @@ void record_capture_commands(ID3D12GraphicsCommandList* cl, ID3D12Resource* back
                 }
 
                 if (g_dx12.srv_copy_tex) {
-                    const D3D12_RESOURCE_STATES src_orig_state = using_snap
-                        ? D3D12_RESOURCE_STATE_COPY_DEST
-                        : D3D12_RESOURCE_STATE_DEPTH_WRITE;
+                    D3D12_RESOURCE_STATES src_orig_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+                    if (using_snap) {
+                        src_orig_state = D3D12_RESOURCE_STATE_COPY_DEST;
+                    } else {
+                        std::lock_guard tlock(g_track_mutex);
+                        auto it_s = g_res_state.find(src_tex);
+                        if (it_s != g_res_state.end()) src_orig_state = it_s->second;
+                    }
                     if (!using_snap) {
-                        D3D12_RESOURCE_BARRIER b_src = make_transition(src_tex, src_orig_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
-                        cl->ResourceBarrier(1, &b_src);
+                        if (src_orig_state != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+                            D3D12_RESOURCE_BARRIER b_src = make_transition(src_tex, src_orig_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                            cl->ResourceBarrier(1, &b_src);
+                        }
                     } else {
                         D3D12_RESOURCE_BARRIER b_src = make_transition(src_tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
                         cl->ResourceBarrier(1, &b_src);
@@ -828,6 +839,30 @@ void STDMETHODCALLTYPE hkCopyDescriptorsSimple(ID3D12Device* dev, UINT num, D3D1
     }
 }
 
+void STDMETHODCALLTYPE hkResourceBarrier(ID3D12GraphicsCommandList* cmd, UINT num_barriers, const D3D12_RESOURCE_BARRIER* barriers) {
+    if (barriers && num_barriers > 0 && g_dx12.width > 0) {
+        std::lock_guard lock(g_track_mutex);
+        for (UINT i = 0; i < num_barriers; ++i) {
+            if (barriers[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION && barriers[i].Transition.pResource) {
+                ID3D12Resource* res = barriers[i].Transition.pResource;
+                const auto rd = res->GetDesc();
+                if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                    (rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) &&
+                    rd.SampleDesc.Count == 1) {
+                    g_res_state[res] = barriers[i].Transition.StateAfter;
+                    if (barriers[i].Transition.StateBefore == D3D12_RESOURCE_STATE_DEPTH_WRITE ||
+                        barriers[i].Transition.StateAfter == D3D12_RESOURCE_STATE_DEPTH_WRITE) {
+                        g_dx12.heuristic.record_draw(reinterpret_cast<uintptr_t>(res),
+                                                     static_cast<uint32_t>(rd.Width), rd.Height,
+                                                     g_dx12.width, g_dx12.height);
+                    }
+                }
+            }
+        }
+    }
+    oResourceBarrier(cmd, num_barriers, barriers);
+}
+
 void STDMETHODCALLTYPE hkOMSetRenderTargets(ID3D12GraphicsCommandList* cmd, UINT num_rtvs,
                                           const D3D12_CPU_DESCRIPTOR_HANDLE* rtvs, BOOL single_handle,
                                           const D3D12_CPU_DESCRIPTOR_HANDLE* dsv) {
@@ -998,6 +1033,7 @@ bool install_dx12_hooks() {
     MH_CreateHook(dev_vt[21], reinterpret_cast<void*>(hkCreateDepthStencilView), reinterpret_cast<void**>(&oCreateDepthStencilView));
     MH_CreateHook(dev_vt[23], reinterpret_cast<void*>(hkCopyDescriptors), reinterpret_cast<void**>(&oCopyDescriptors));
     MH_CreateHook(dev_vt[24], reinterpret_cast<void*>(hkCopyDescriptorsSimple), reinterpret_cast<void**>(&oCopyDescriptorsSimple));
+    MH_CreateHook(cmd_vt[26], reinterpret_cast<void*>(hkResourceBarrier), reinterpret_cast<void**>(&oResourceBarrier));
     MH_CreateHook(cmd_vt[46], reinterpret_cast<void*>(hkOMSetRenderTargets), reinterpret_cast<void**>(&oOMSetRenderTargets));
     MH_CreateHook(cmd_vt[47], reinterpret_cast<void*>(hkClearDepthStencilView), reinterpret_cast<void**>(&oClearDepthStencilView));
     return MH_EnableHook(MH_ALL_HOOKS) == MH_OK;
