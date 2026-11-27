@@ -11,6 +11,8 @@ struct EncoderSettings {
     DepthMode depth_mode = DepthMode::Rgb24Lossless;
     bool depth_enabled = true;
     uint32_t fps = 60;
+    uint32_t h264_quality = 85; // 1..100
+    std::wstring extra_ffmpeg_flags;
 };
 
 class VideoEncoder {

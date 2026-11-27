@@ -113,27 +113,47 @@ bool VideoEncoder::start(uint32_t width, uint32_t height, const EncoderSettings&
     const std::wstring res = std::to_wstring(width) + L"x" + std::to_wstring(height);
     const std::wstring fps_s = std::to_wstring(settings.fps ? settings.fps : 60);
 
+    const uint32_t q = std::clamp<uint32_t>(settings.h264_quality, 1, 100);
+    const uint32_t qp = 42 - (q * 32) / 100; // 100% -> 10, 85% -> 15, 50% -> 26
+    const uint32_t mbps = std::max<uint32_t>(2, (q * q) / 200); // 85% -> 36M, 100% -> 50M
+    std::wstring h264_opts;
+    if (h264_codec == "h264_nvenc") {
+        h264_opts = L"-rc vbr -cq " + std::to_wstring(qp) + L" -b:v 0";
+    } else if (h264_codec == "h264_amf") {
+        h264_opts = L"-rc cqp -qp_i " + std::to_wstring(qp) + L" -qp_p " + std::to_wstring(qp);
+    } else if (h264_codec == "h264_qsv") {
+        h264_opts = L"-global_quality " + std::to_wstring(qp);
+    } else if (h264_codec == "libx264") {
+        h264_opts = L"-crf " + std::to_wstring(qp);
+    } else {
+        h264_opts = L"-b:v " + std::to_wstring(mbps) + L"M -maxrate " + std::to_wstring(mbps * 2) + L"M";
+    }
+    if (!settings.extra_ffmpeg_flags.empty()) {
+        h264_opts += L" " + settings.extra_ffmpeg_flags;
+    }
+
     color_path_ = (std::filesystem::path(settings.output_dir) / (std::wstring(L"color_") + ts + L".mp4")).wstring();
     const std::wstring color_cmd =
         L"\"" + ffmpeg + L"\" -y -loglevel error -f rawvideo -pix_fmt bgra -s " + res +
-        L" -r " + fps_s + L" -i - -c:v " + h264_w + L" -pix_fmt yuv420p \"" + color_path_ + L"\"";
+        L" -r " + fps_s + L" -i - -c:v " + h264_w + L" " + h264_opts + L" -pix_fmt yuv420p \"" + color_path_ + L"\"";
 
     if (!spawn_pipe(color_cmd, color_proc_)) return false;
 
     has_depth_ = settings.depth_enabled;
     if (has_depth_) {
         std::wstring depth_cmd;
+        const std::wstring extra = settings.extra_ffmpeg_flags.empty() ? L"" : (L" " + settings.extra_ffmpeg_flags);
         if (settings.depth_mode == DepthMode::Rgb24Lossless) {
             depth_path_ = (std::filesystem::path(settings.output_dir) / (std::wstring(L"depth_") + ts + L".mkv")).wstring();
             depth_cmd =
                 L"\"" + ffmpeg + L"\" -y -loglevel error -f rawvideo -pix_fmt rgb0 -s " + res +
-                L" -r " + fps_s + L" -i - -c:v utvideo -pix_fmt rgb24 \"" + depth_path_ + L"\"";
+                L" -r " + fps_s + L" -i - -c:v utvideo -pix_fmt rgb24" + extra + L" \"" + depth_path_ + L"\"";
         } else {
             depth_path_ = (std::filesystem::path(settings.output_dir) / (std::wstring(L"depth_") + ts + L".mp4")).wstring();
             const std::wstring in_fmt = (settings.depth_mode == DepthMode::Gray8) ? L"gray" : L"rgb0";
             depth_cmd =
                 L"\"" + ffmpeg + L"\" -y -loglevel error -f rawvideo -pix_fmt " + in_fmt + L" -s " + res +
-                L" -r " + fps_s + L" -i - -c:v " + h264_w + L" -pix_fmt yuv420p \"" + depth_path_ + L"\"";
+                L" -r " + fps_s + L" -i - -c:v " + h264_w + L" " + h264_opts + L" -pix_fmt yuv420p \"" + depth_path_ + L"\"";
         }
         if (!spawn_pipe(depth_cmd, depth_proc_)) {
             close_pipe(color_proc_);

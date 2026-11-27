@@ -25,6 +25,8 @@ void consumer_loop(dr::RecorderAppState& app, uint64_t max_frames) {
                     es.depth_mode = static_cast<dr::DepthMode>(hdr.depth_mode);
                     es.depth_enabled = (hdr.has_depth != 0);
                     es.fps = 60;
+                    es.h264_quality = app.h264_quality;
+                    es.extra_ffmpeg_flags = app.extra_ffmpeg_flags;
                     if (app.encoder.start(hdr.width, hdr.height, es)) {
                         cur_w = hdr.width;
                         cur_h = hdr.height;

@@ -21,10 +21,18 @@ enum class OverlayCorner : uint32_t {
 inline constexpr wchar_t kConfigMappingName[] = L"Local\\DepthRecorderConfigV1";
 inline constexpr wchar_t kRingMappingName[]   = L"Local\\DepthRecorderRingV1";
 inline constexpr wchar_t kFrameEventName[]    = L"Local\\DepthRecorderFrameEventV1";
+inline constexpr uint32_t kMaxSwapchains      = 8;
+
+struct SwapchainInfo {
+    uint64_t id = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    wchar_t title[48]{};
+};
 
 struct SharedConfig {
     uint32_t magic = 0x44524331; // 'DRC1'
-    uint32_t version = 1;
+    uint32_t version = 2;
 
     // Recording state (0 = idle, 1 = recording)
     volatile LONG recording = 0;
@@ -54,7 +62,45 @@ struct SharedConfig {
     volatile LONG selected_depth_index = 0;
     volatile LONG current_fps_x10 = 0; // FPS * 10
     volatile LONG dropped_frames = 0;
+
+    SwapchainInfo swapchains[kMaxSwapchains]{};
+    volatile LONG swapchain_count = 0;
+    volatile LONG selected_swapchain_index = 0;
 };
+
+// Registers a swapchain/window in SharedConfig and returns true if it is currently selected by the user.
+inline bool register_and_is_selected_swapchain(SharedConfig* cfg, uint64_t id, uint32_t w, uint32_t h, HWND hwnd) {
+    if (!cfg || id == 0 || w < 64 || h < 64) return false;
+    LONG count = cfg->swapchain_count;
+    if (count < 0) count = 0;
+    if (count > static_cast<LONG>(kMaxSwapchains)) count = static_cast<LONG>(kMaxSwapchains);
+
+    LONG found = -1;
+    for (LONG i = 0; i < count; ++i) {
+        if (cfg->swapchains[i].id == id) {
+            found = i;
+            break;
+        }
+    }
+    if (found < 0 && count < static_cast<LONG>(kMaxSwapchains)) {
+        found = count;
+        cfg->swapchains[found].id = id;
+        InterlockedExchange(&cfg->swapchain_count, count + 1);
+        count = count + 1;
+    }
+    if (found < 0) return false;
+
+    cfg->swapchains[found].width = w;
+    cfg->swapchains[found].height = h;
+    if (hwnd) {
+        GetWindowTextW(hwnd, cfg->swapchains[found].title, 48);
+    } else {
+        cfg->swapchains[found].title[0] = L'\0';
+    }
+    LONG sel = cfg->selected_swapchain_index;
+    if (sel < 0 || sel >= count) sel = 0;
+    return found == sel;
+}
 
 class SharedConfigView {
 public:

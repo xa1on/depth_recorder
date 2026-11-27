@@ -1122,7 +1122,7 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_vkQueuePresentKHR(VkQueue queue, const VkPre
 
                     if (overlay) {
                         char text[32]{};
-                        std::snprintf(text, sizeof(text), "%.0f FPS", fps);
+                        std::snprintf(text, sizeof(text), "%.0f", fps);
                         std::vector<uint8_t> rgba;
                         uint32_t bw = 0, bh = 0;
                         dr::render_fps_bitmap(text, cfg->recording != 0, rgba, bw, bh);

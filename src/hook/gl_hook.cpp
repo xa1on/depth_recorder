@@ -579,7 +579,7 @@ void draw_fps_overlay(double fps, bool recording, OverlayCorner corner) {
     if (!g_gl.overlay_prog || g_gl.width == 0 || g_gl.height == 0) return;
 
     char text[32]{};
-    std::snprintf(text, sizeof(text), "%.0f FPS", fps);
+    std::snprintf(text, sizeof(text), "%.0f", fps);
     std::vector<uint8_t> rgba;
     uint32_t bw = 0, bh = 0;
     render_fps_bitmap(text, recording, rgba, bw, bh);
@@ -772,7 +772,14 @@ void record_active_draw() {
 BOOL WINAPI hkWglSwapBuffers(HDC hdc) {
     {
         std::lock_guard lock(g_mutex);
-        if (ensure_pipeline(hdc)) {
+        if (!g_config_view.get()) g_config_view.open_or_create(false);
+        HWND hwnd = WindowFromDC(hdc);
+        RECT rc{};
+        const uint32_t w = (hwnd && GetClientRect(hwnd, &rc)) ? static_cast<uint32_t>(rc.right - rc.left) : 0;
+        const uint32_t h = (hwnd && GetClientRect(hwnd, &rc)) ? static_cast<uint32_t>(rc.bottom - rc.top) : 0;
+        const bool selected = !g_config_view.get() ||
+            register_and_is_selected_swapchain(g_config_view.get(), reinterpret_cast<uint64_t>(hwnd ? hwnd : reinterpret_cast<HWND>(hdc)), w, h, hwnd);
+        if (selected && ensure_pipeline(hdc)) {
             LARGE_INTEGER now{};
             QueryPerformanceCounter(&now);
             double fps = 60.0;

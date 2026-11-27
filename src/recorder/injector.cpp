@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <psapi.h>
 #include <tlhelp32.h>
+#include <unordered_map>
 
 namespace dr {
 
@@ -72,6 +73,20 @@ bool is_compatible_process(DWORD pid, DWORD self_pid) {
 } // namespace
 
 std::vector<ProcessEntry> list_processes() {
+    std::unordered_map<DWORD, std::wstring> pid_titles;
+    EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
+        if (!IsWindowVisible(hwnd)) return TRUE;
+        wchar_t title[128]{};
+        if (GetWindowTextW(hwnd, title, 128) <= 0) return TRUE;
+        DWORD wpid = 0;
+        GetWindowThreadProcessId(hwnd, &wpid);
+        auto* map = reinterpret_cast<std::unordered_map<DWORD, std::wstring>*>(lp);
+        if (wpid && map->find(wpid) == map->end()) {
+            (*map)[wpid] = title;
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&pid_titles));
+
     std::vector<ProcessEntry> list;
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return list;
@@ -81,7 +96,12 @@ std::vector<ProcessEntry> list_processes() {
     if (Process32FirstW(snap, &pe)) {
         do {
             if (is_compatible_process(pe.th32ProcessID, self_pid)) {
-                list.push_back({pe.th32ProcessID, pe.szExeFile});
+                std::wstring label = pe.szExeFile;
+                auto it = pid_titles.find(pe.th32ProcessID);
+                if (it != pid_titles.end() && !it->second.empty()) {
+                    label += L" - " + it->second;
+                }
+                list.push_back({pe.th32ProcessID, label});
             }
         } while (Process32NextW(snap, &pe));
     }

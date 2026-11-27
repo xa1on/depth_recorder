@@ -38,6 +38,11 @@ enum ControlId : int {
     IDC_SLIDER_ZNEAR = 124,
     IDC_SLIDER_ZFAR = 125,
     IDC_BTN_AUTOCONFIG = 126,
+    IDC_BTN_DETACH = 127,
+    IDC_SWAP_COMBO = 128,
+    IDC_SLIDER_QUAL = 129,
+    IDC_LBL_QUAL = 130,
+    IDC_EDIT_FFMPEG = 131,
 };
 
 constexpr int kHotkeyRecordId = 1;
@@ -54,6 +59,7 @@ struct UiContext {
     UINT rec_mod = 0;
     UINT cyc_mod = 0;
     LONG last_auto_backend = 0;
+    LONG last_swapchain_count = -1;
 };
 
 void populate_processes(UiContext* ctx) {
@@ -206,6 +212,11 @@ void sync_ui_to_config(UiContext* ctx) {
         const float zf = static_cast<float>(_wtof(zbuf));
         if (zf > cfg->z_near) cfg->z_far = zf;
     }
+
+    ctx->app->h264_quality = static_cast<uint32_t>(SendMessageW(GetDlgItem(ctx->hwnd, IDC_SLIDER_QUAL), TBM_GETPOS, 0, 0));
+    wchar_t ffbuf[256]{};
+    GetWindowTextW(GetDlgItem(ctx->hwnd, IDC_EDIT_FFMPEG), ffbuf, 256);
+    ctx->app->extra_ffmpeg_flags = ffbuf;
 }
 
 void toggle_recording(UiContext* ctx) {
@@ -258,7 +269,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
             ctx->font = CreateFontIndirectW(&ncm.lfMessageFont);
 
-            HWND tab = add_ctrl(hwnd, ctx->font, WC_TABCONTROLW, L"", 0, 8, 6, 614, 276, IDC_TAB_MAIN);
+            HWND tab = add_ctrl(hwnd, ctx->font, WC_TABCONTROLW, L"", 0, 8, 6, 614, 308, IDC_TAB_MAIN);
             TCITEMW tie{};
             tie.mask = TCIF_TEXT;
             tie.pszText = const_cast<wchar_t*>(L"Capture");
@@ -278,55 +289,59 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             };
 
             cap(L"STATIC", L"Target Process:", 0, 12, 14, 100, 20, 0);
-            cap(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 115, 10, 324, 240, IDC_PROC_COMBO);
-            cap(L"BUTTON", L"Attach", 0, 446, 10, 68, 24, IDC_BTN_ATTACH);
+            cap(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 115, 10, 250, 240, IDC_PROC_COMBO);
+            cap(L"BUTTON", L"Attach", 0, 372, 10, 68, 24, IDC_BTN_ATTACH);
+            cap(L"BUTTON", L"Detach", 0, 446, 10, 68, 24, IDC_BTN_DETACH);
             cap(L"BUTTON", L"Launch EXE...", 0, 520, 10, 96, 24, IDC_BTN_LAUNCH);
 
-            cap(L"STATIC", L"Output Folder:", 0, 12, 46, 100, 20, 0);
-            cap(L"EDIT", ctx->app->output_dir.c_str(), WS_BORDER | ES_AUTOHSCROLL, 115, 44, 425, 22, IDC_EDIT_OUTDIR);
-            cap(L"BUTTON", L"Browse...", 0, 546, 43, 70, 24, IDC_BTN_BROWSE);
+            cap(L"STATIC", L"Target Window:", 0, 12, 46, 100, 20, 0);
+            cap(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 115, 42, 501, 200, IDC_SWAP_COMBO);
 
-            cap(L"STATIC", L"Depth Format:", 0, 12, 80, 100, 20, 0);
-            HWND mode_cb = cap(L"COMBOBOX", L"", CBS_DROPDOWNLIST, 115, 76, 240, 120, IDC_MODE_COMBO);
+            cap(L"STATIC", L"Output Folder:", 0, 12, 78, 100, 20, 0);
+            cap(L"EDIT", ctx->app->output_dir.c_str(), WS_BORDER | ES_AUTOHSCROLL, 115, 76, 425, 22, IDC_EDIT_OUTDIR);
+            cap(L"BUTTON", L"Browse...", 0, 546, 75, 70, 24, IDC_BTN_BROWSE);
+
+            cap(L"STATIC", L"Depth Format:", 0, 12, 112, 100, 20, 0);
+            HWND mode_cb = cap(L"COMBOBOX", L"", CBS_DROPDOWNLIST, 115, 108, 240, 120, IDC_MODE_COMBO);
             SendMessageW(mode_cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Gray8 (H.264 MP4)"));
             SendMessageW(mode_cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"ColorPhase (H.264 MP4, Lossy-Safe)"));
             SendMessageW(mode_cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"RGB24 Lossless (UtVideo MKV, 16.7M)"));
             SendMessageW(mode_cb, CB_SETCURSEL, 2, 0);
 
-            cap(L"STATIC", L"Overlay Corner:", 0, 372, 80, 95, 20, 0);
-            HWND corner_cb = cap(L"COMBOBOX", L"", CBS_DROPDOWNLIST, 470, 76, 146, 120, IDC_CORNER_COMBO);
+            cap(L"STATIC", L"Overlay Corner:", 0, 372, 112, 95, 20, 0);
+            HWND corner_cb = cap(L"COMBOBOX", L"", CBS_DROPDOWNLIST, 470, 108, 146, 120, IDC_CORNER_COMBO);
             SendMessageW(corner_cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Top-Left"));
             SendMessageW(corner_cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Top-Right"));
             SendMessageW(corner_cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Bottom-Left"));
             SendMessageW(corner_cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Bottom-Right"));
             SendMessageW(corner_cb, CB_SETCURSEL, 0, 0);
 
-            HWND c1 = cap(L"BUTTON", L"Enable Depth Pass", BS_AUTOCHECKBOX, 12, 114, 135, 22, IDC_CHK_DEPTH);
-            HWND c2 = cap(L"BUTTON", L"Linearize (Gray8/Phase)", BS_AUTOCHECKBOX, 155, 114, 165, 22, IDC_CHK_LINEAR);
-            HWND c3 = cap(L"BUTTON", L"Reversed-Z", BS_AUTOCHECKBOX, 330, 114, 100, 22, IDC_CHK_REVZ);
-            HWND c4 = cap(L"BUTTON", L"In-Game FPS Overlay", BS_AUTOCHECKBOX, 445, 114, 165, 22, IDC_CHK_OVERLAY);
+            HWND c1 = cap(L"BUTTON", L"Enable Depth Pass", BS_AUTOCHECKBOX, 12, 146, 135, 22, IDC_CHK_DEPTH);
+            HWND c2 = cap(L"BUTTON", L"Linearize (Gray8/Phase)", BS_AUTOCHECKBOX, 155, 146, 165, 22, IDC_CHK_LINEAR);
+            HWND c3 = cap(L"BUTTON", L"Reversed-Z", BS_AUTOCHECKBOX, 330, 146, 100, 22, IDC_CHK_REVZ);
+            HWND c4 = cap(L"BUTTON", L"In-Game FPS Overlay", BS_AUTOCHECKBOX, 445, 146, 165, 22, IDC_CHK_OVERLAY);
             SendMessageW(c1, BM_SETCHECK, BST_CHECKED, 0);
             SendMessageW(c2, BM_SETCHECK, BST_CHECKED, 0);
             SendMessageW(c3, BM_SETCHECK, BST_CHECKED, 0);
             SendMessageW(c4, BM_SETCHECK, BST_CHECKED, 0);
 
-            cap(L"STATIC", L"Z-Near:", 0, 12, 146, 52, 20, 0);
-            cap(L"EDIT", L"0.100", WS_BORDER | ES_AUTOHSCROLL, 66, 143, 80, 22, IDC_EDIT_ZNEAR);
-            HWND s_zn = cap(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_NOTICKS, 12, 168, 190, 24, IDC_SLIDER_ZNEAR);
+            cap(L"STATIC", L"Z-Near:", 0, 12, 178, 52, 20, 0);
+            cap(L"EDIT", L"0.100", WS_BORDER | ES_AUTOHSCROLL, 66, 175, 80, 22, IDC_EDIT_ZNEAR);
+            HWND s_zn = cap(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_NOTICKS, 12, 200, 190, 24, IDC_SLIDER_ZNEAR);
             SendMessageW(s_zn, TBM_SETRANGE, TRUE, MAKELONG(0, 1000));
             SendMessageW(s_zn, TBM_SETPOS, TRUE, znear_to_slider(0.1f));
 
-            cap(L"STATIC", L"Z-Far:", 0, 220, 146, 46, 20, 0);
-            cap(L"EDIT", L"500.0", WS_BORDER | ES_AUTOHSCROLL, 268, 143, 86, 22, IDC_EDIT_ZFAR);
-            HWND s_zf = cap(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_NOTICKS, 220, 168, 190, 24, IDC_SLIDER_ZFAR);
+            cap(L"STATIC", L"Z-Far:", 0, 220, 178, 46, 20, 0);
+            cap(L"EDIT", L"500.0", WS_BORDER | ES_AUTOHSCROLL, 268, 175, 86, 22, IDC_EDIT_ZFAR);
+            HWND s_zf = cap(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_NOTICKS, 220, 200, 190, 24, IDC_SLIDER_ZFAR);
             SendMessageW(s_zf, TBM_SETRANGE, TRUE, MAKELONG(0, 1000));
             SendMessageW(s_zf, TBM_SETPOS, TRUE, zfar_to_slider(500.0f));
 
-            cap(L"BUTTON", L"Auto Config", 0, 424, 148, 192, 34, IDC_BTN_AUTOCONFIG);
+            cap(L"BUTTON", L"Auto Config", 0, 424, 180, 192, 34, IDC_BTN_AUTOCONFIG);
 
-            cap(L"BUTTON", L"Start Recording (F9)", BS_DEFPUSHBUTTON, 12, 202, 295, 32, IDC_BTN_RECORD);
-            cap(L"BUTTON", L"Cycle Depth Buffer (F10)", 0, 321, 202, 295, 32, IDC_BTN_CYCLE_DEPTH);
-            add_ctrl(hwnd, ctx->font, L"STATIC", L"State: Idle", SS_SUNKEN, 12, 288, 604, 24, IDC_LBL_STATUS);
+            cap(L"BUTTON", L"Start Recording (F9)", BS_DEFPUSHBUTTON, 12, 234, 295, 32, IDC_BTN_RECORD);
+            cap(L"BUTTON", L"Cycle Depth Buffer (F10)", 0, 321, 234, 295, 32, IDC_BTN_CYCLE_DEPTH);
+            add_ctrl(hwnd, ctx->font, L"STATIC", L"State: Idle", SS_SUNKEN, 12, 320, 604, 24, IDC_LBL_STATUS);
 
             // Settings tab controls
             set(L"STATIC", L"Record Toggle Keybind:", 0, 20, 24, 160, 20, 0);
@@ -340,7 +355,16 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             HWND c_prev = set(L"BUTTON", L"Live Depth Preview", BS_AUTOCHECKBOX, 190, 96, 160, 22, IDC_CHK_PREVIEW);
             SendMessageW(c_prev, BM_SETCHECK, BST_CHECKED, 0);
 
-            set(L"BUTTON", L"Apply Keybinds", 0, 190, 128, 200, 28, IDC_BTN_APPLY_HK);
+            set(L"STATIC", L"H.264 Quality:", 0, 20, 130, 160, 20, 0);
+            HWND s_qual = set(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_NOTICKS, 190, 126, 200, 24, IDC_SLIDER_QUAL);
+            SendMessageW(s_qual, TBM_SETRANGE, TRUE, MAKELONG(1, 100));
+            SendMessageW(s_qual, TBM_SETPOS, TRUE, static_cast<LPARAM>(ctx->app->h264_quality));
+            set(L"STATIC", L"85%", 0, 398, 130, 50, 20, IDC_LBL_QUAL);
+
+            set(L"STATIC", L"Extra FFmpeg Flags:", 0, 20, 164, 160, 20, 0);
+            set(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, 190, 161, 300, 22, IDC_EDIT_FFMPEG);
+
+            set(L"BUTTON", L"Apply Keybinds / Settings", 0, 190, 196, 200, 28, IDC_BTN_APPLY_HK);
 
             add_ctrl(hwnd, ctx->font, L"STATIC", L"Depth Preview:", 0, 632, 8, 240, 18, 0);
             add_ctrl(hwnd, ctx->font, L"STATIC", L"", SS_OWNERDRAW | WS_BORDER, 632, 30, 240, 240, IDC_PREVIEW_BOX);
@@ -368,6 +392,12 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 swprintf_s(buf, L"%.1f", zf);
                 SetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_ZFAR), buf);
                 sync_ui_to_config(ctx);
+            } else if (src == GetDlgItem(hwnd, IDC_SLIDER_QUAL)) {
+                const int pos = static_cast<int>(SendMessageW(src, TBM_GETPOS, 0, 0));
+                wchar_t buf[16]{};
+                swprintf_s(buf, L"%d%%", pos);
+                SetWindowTextW(GetDlgItem(hwnd, IDC_LBL_QUAL), buf);
+                sync_ui_to_config(ctx);
             }
             return 0;
         }
@@ -389,6 +419,28 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     std::wstring err;
                     if (!inject_dll(ctx->procs[idx].pid, ctx->app->hook_dll_path, &err)) {
                         MessageBoxW(hwnd, err.empty() ? L"Failed to inject depth_hook.dll." : err.c_str(), L"Depth Recorder", MB_ICONERROR);
+                    }
+                }
+            } else if (id == IDC_BTN_DETACH) {
+                if (auto* cfg = ctx->app->config_view.get()) {
+                    InterlockedExchange(&cfg->recording, 0);
+                    InterlockedIncrement(&cfg->unload_seq);
+                    InterlockedExchange(&cfg->hooked_pid, 0);
+                    InterlockedExchange(&cfg->active_backend, 0);
+                    InterlockedExchange(&cfg->candidate_depth_count, 0);
+                    InterlockedExchange(&cfg->swapchain_count, 0);
+                    InterlockedExchange(&cfg->selected_swapchain_index, 0);
+                    ctx->last_auto_backend = 0;
+                    ctx->last_swapchain_count = -1;
+                    SetWindowTextW(GetDlgItem(hwnd, IDC_BTN_RECORD), L"Start Recording (F9)");
+                    std::lock_guard lock(ctx->app->preview_mutex);
+                    ctx->app->preview_bgra.clear();
+                }
+            } else if (id == IDC_SWAP_COMBO && code == CBN_SELCHANGE) {
+                const LRESULT idx = SendMessageW(GetDlgItem(hwnd, IDC_SWAP_COMBO), CB_GETCURSEL, 0, 0);
+                if (idx >= 0) {
+                    if (auto* cfg = ctx->app->config_view.get()) {
+                        InterlockedExchange(&cfg->selected_swapchain_index, static_cast<LONG>(idx));
                     }
                 }
             } else if (id == IDC_BTN_LAUNCH) {
@@ -489,6 +541,22 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     ctx->last_auto_backend = cfg->active_backend;
                     run_auto_config(ctx, true);
                 }
+                if (cfg->swapchain_count != ctx->last_swapchain_count) {
+                    ctx->last_swapchain_count = cfg->swapchain_count;
+                    HWND sc_cb = GetDlgItem(hwnd, IDC_SWAP_COMBO);
+                    SendMessageW(sc_cb, CB_RESETCONTENT, 0, 0);
+                    const LONG cnt = std::clamp<LONG>(static_cast<LONG>(cfg->swapchain_count), 0L, static_cast<LONG>(kMaxSwapchains));
+                    for (LONG i = 0; i < cnt; ++i) {
+                        wchar_t sbuf[128]{};
+                        swprintf_s(sbuf, L"[%ld] %ux%u %s", i, cfg->swapchains[i].width, cfg->swapchains[i].height,
+                                   cfg->swapchains[i].title[0] ? cfg->swapchains[i].title : L"(Untitled)");
+                        SendMessageW(sc_cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(sbuf));
+                    }
+                    if (cnt > 0) {
+                        const LONG sel = std::clamp<LONG>(static_cast<LONG>(cfg->selected_swapchain_index), 0L, cnt - 1);
+                        SendMessageW(sc_cb, CB_SETCURSEL, sel, 0);
+                    }
+                }
             }
             update_status(ctx);
             if (HWND pv = GetDlgItem(hwnd, IDC_PREVIEW_BOX)) {
@@ -527,7 +595,7 @@ int run_win32_ui(HINSTANCE hInstance, RecorderAppState& app) {
     HWND hwnd = CreateWindowExW(
         0, wc.lpszClassName, L"Depth Recorder (Portable)",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 895, 355,
+        CW_USEDEFAULT, CW_USEDEFAULT, 895, 388,
         nullptr, nullptr, hInstance, &ctx);
     if (!hwnd) return 1;
 

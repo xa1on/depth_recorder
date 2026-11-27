@@ -313,7 +313,7 @@ void draw_fps_overlay(IDXGISwapChain* swap, double fps, bool recording, OverlayC
     if (FAILED(g_dx11.device->CreateRenderTargetView(backbuf.Get(), nullptr, rtv.GetAddressOf()))) return;
 
     char text[32]{};
-    std::snprintf(text, sizeof(text), "%.0f FPS", fps);
+    std::snprintf(text, sizeof(text), "%.0f", fps);
     std::vector<uint8_t> rgba;
     uint32_t bw = 0, bh = 0;
     render_fps_bitmap(text, recording, rgba, bw, bh);
@@ -533,7 +533,13 @@ HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swap, UINT sync, UINT flags)
     }
     {
         std::lock_guard lock(g_mutex);
-        if (ensure_pipeline(swap)) {
+        if (!g_config_view.get()) g_config_view.open_or_create(false);
+        DXGI_SWAP_CHAIN_DESC scd{};
+        const bool desc_ok = SUCCEEDED(swap->GetDesc(&scd));
+        const bool selected = !g_config_view.get() || (desc_ok &&
+            register_and_is_selected_swapchain(g_config_view.get(), reinterpret_cast<uint64_t>(swap),
+                                               scd.BufferDesc.Width, scd.BufferDesc.Height, scd.OutputWindow));
+        if (selected && ensure_pipeline(swap)) {
             LARGE_INTEGER now{};
             QueryPerformanceCounter(&now);
             double fps = 60.0;
