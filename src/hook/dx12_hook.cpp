@@ -1,7 +1,5 @@
 #include "dx12_hook.h"
-#include "common/config.h"
-#include "common/ipc_ring.h"
-#include "depth_heuristic.h"
+#include "hook_common.h"
 #include "fps_overlay_font.h"
 
 #include "depth_convert_cs.h"
@@ -31,17 +29,6 @@ extern IpcRing g_ipc_ring;
 namespace {
 
 constexpr uint32_t kStagingSlots = 3;
-
-struct DepthConvertParams {
-    uint32_t width;
-    uint32_t height;
-    uint32_t mode;
-    uint32_t linearize;
-    uint32_t reversed_z;
-    float z_near;
-    float z_far;
-    float pad;
-};
 
 struct DsvEntry {
     ComPtr<ID3D12Resource> resource;
@@ -534,16 +521,10 @@ void record_capture_commands(ID3D12GraphicsCommandList* cl, ID3D12Resource* back
         std::lock_guard tlock(g_track_mutex);
         ranked = g_dx12.heuristic.ranked_candidates();
     }
-    if (cfg) {
-        InterlockedExchange(&cfg->candidate_depth_count, static_cast<LONG>(ranked.size()));
-        if (!ranked.empty()) {
-            g_dx12.selected_depth_idx %= static_cast<uint32_t>(ranked.size());
-            InterlockedExchange(&cfg->selected_depth_index, static_cast<LONG>(g_dx12.selected_depth_idx));
-        }
-    }
+    DepthCandidate cand{};
+    const bool has_cand = select_depth_candidate(ranked, cfg, g_dx12.selected_depth_idx, cand);
 
-    if (want_depth && !ranked.empty() && g_dx12.cs_pso) {
-        const auto& cand = ranked[g_dx12.selected_depth_idx % ranked.size()];
+    if (want_depth && has_cand && g_dx12.cs_pso) {
         ComPtr<ID3D12Resource> src_tex_ref;
         {
             std::lock_guard tlock(g_track_mutex);
@@ -682,11 +663,9 @@ void record_capture_commands(ID3D12GraphicsCommandList* cl, ID3D12Resource* back
 void record_overlay_commands(ID3D12GraphicsCommandList* cl, ID3D12Resource* backbuf, double fps, bool recording, OverlayCorner corner) {
     if (!g_dx12.gfx_pso) return;
 
-    char text[32]{};
-    std::snprintf(text, sizeof(text), "%.0f", fps);
     std::vector<uint8_t> rgba;
     uint32_t bw = 0, bh = 0;
-    render_fps_bitmap(text, recording, rgba, bw, bh);
+    render_fps_overlay_rgba(fps, recording, rgba, bw, bh);
 
     if (!g_dx12.font_tex || g_dx12.font_w != bw || g_dx12.font_h != bh) {
         g_dx12.font_tex = create_default_tex(g_dx12.device.Get(), bw, bh, DXGI_FORMAT_R8G8B8A8_UNORM,
@@ -742,20 +721,8 @@ void record_overlay_commands(ID3D12GraphicsCommandList* cl, ID3D12Resource* back
     b_font = make_transition(g_dx12.font_tex.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     cl->ResourceBarrier(1, &b_font);
 
-    const float pad_px = 12.0f;
-    const float w_ndc = (2.0f * bw) / static_cast<float>(g_dx12.width);
-    const float h_ndc = (2.0f * bh) / static_cast<float>(g_dx12.height);
-    const float px_ndc = (2.0f * pad_px) / static_cast<float>(g_dx12.width);
-    const float py_ndc = (2.0f * pad_px) / static_cast<float>(g_dx12.height);
-
-    float x0 = -1.0f + px_ndc, y1 = 1.0f - py_ndc;
-    if (corner == OverlayCorner::TopRight || corner == OverlayCorner::BottomRight) {
-        x0 = 1.0f - px_ndc - w_ndc;
-    }
-    if (corner == OverlayCorner::BottomLeft || corner == OverlayCorner::BottomRight) {
-        y1 = -1.0f + py_ndc + h_ndc;
-    }
-    const float ndc_rect[4] = {x0, y1 - h_ndc, x0 + w_ndc, y1};
+    float ndc_rect[4]{};
+    compute_overlay_ndc_rect(bw, bh, g_dx12.width, g_dx12.height, corner, ndc_rect);
 
     D3D12_RENDER_TARGET_VIEW_DESC rtvd{};
     rtvd.Format = g_dx12.bb_format;
@@ -800,20 +767,10 @@ void flush_readback_slot(uint32_t read_slot, SharedConfig* cfg) {
         depth_bytes = static_cast<uint32_t>(g_dx12.depth_pack_buf.size());
     }
 
-    FrameHeader hdr{};
-    hdr.frame_index = g_dx12.frame_idx;
-    hdr.qpc_timestamp = g_dx12.slot_qpc[read_slot];
-    hdr.qpc_freq = g_dx12.qpc_freq;
-    hdr.width = g_dx12.width;
-    hdr.height = g_dx12.height;
-    hdr.color_bytes = static_cast<uint32_t>(g_dx12.color_pack_buf.size());
-    hdr.depth_bytes = depth_bytes;
-    hdr.depth_mode = g_dx12.slot_mode[read_slot];
-    hdr.has_depth = g_dx12.slot_has_depth[read_slot] ? 1 : 0;
-
-    if (!g_ipc_ring.try_push(hdr, g_dx12.color_pack_buf.data(), depth_bytes ? g_dx12.depth_pack_buf.data() : nullptr)) {
-        if (cfg) InterlockedIncrement(&cfg->dropped_frames);
-    }
+    push_frame_to_ring(g_ipc_ring, cfg, g_dx12.frame_idx, g_dx12.slot_qpc[read_slot], g_dx12.qpc_freq,
+                       g_dx12.width, g_dx12.height, g_dx12.slot_mode[read_slot], g_dx12.slot_has_depth[read_slot],
+                       g_dx12.color_pack_buf.data(), static_cast<uint32_t>(g_dx12.color_pack_buf.size()),
+                       g_dx12.depth_pack_buf.data(), depth_bytes);
     g_dx12.slot_pending[read_slot] = false;
 }
 
@@ -996,32 +953,11 @@ void dx12_on_present(IDXGISwapChain* swap) {
     if (!ensure_pipeline(swap) || !g_dx12.cmd_queue) return;
     if (FAILED(g_dx12.device->GetDeviceRemovedReason())) return;
 
-    LARGE_INTEGER now{};
-    QueryPerformanceCounter(&now);
-    double fps = 60.0;
-    if (g_dx12.last_qpc != 0 && g_dx12.qpc_freq > 0) {
-        const double dt = static_cast<double>(now.QuadPart - g_dx12.last_qpc) / static_cast<double>(g_dx12.qpc_freq);
-        if (dt > 1e-5) fps = 1.0 / dt;
-    }
-    g_dx12.last_qpc = now.QuadPart;
-
-    if (!g_config_view.get()) g_config_view.open_or_create(false);
-    if (!g_ipc_ring.event_handle()) {
-        if (!g_ipc_ring.open_or_create(false) && g_config_view.get()) {
-            InterlockedExchange(&g_config_view.get()->dropped_frames, static_cast<LONG>(GetLastError()) + 100000);
-        }
-    }
-
+    ensure_ipc_connected(g_config_view, g_ipc_ring);
     SharedConfig* cfg = g_config_view.get();
-    if (cfg) {
-        InterlockedExchange(&cfg->hooked_pid, static_cast<LONG>(GetCurrentProcessId()));
-        InterlockedExchange(&cfg->active_backend, 4);
-        InterlockedExchange(&cfg->current_fps_x10, static_cast<LONG>(fps * 10.0));
-        if (cfg->cycle_depth_seq != g_dx12.last_cycle_seq) {
-            g_dx12.last_cycle_seq = cfg->cycle_depth_seq;
-            g_dx12.selected_depth_idx++;
-        }
-    }
+    int64_t now_qpc = 0;
+    const double fps = tick_fps_and_telemetry(cfg, 4, g_dx12.last_qpc, g_dx12.qpc_freq,
+                                              g_dx12.last_cycle_seq, g_dx12.selected_depth_idx, now_qpc);
 
     const bool recording = (cfg && (cfg->recording != 0 || cfg->preview_enabled != 0) && g_ipc_ring.event_handle());
     const bool overlay = (cfg && cfg->overlay_enabled != 0);
@@ -1048,7 +984,7 @@ void dx12_on_present(IDXGISwapChain* swap) {
             g_dx12.cmd_list->Reset(g_dx12.cmd_alloc[write_slot].Get(), nullptr);
 
             if (recording) {
-                record_capture_commands(g_dx12.cmd_list.Get(), backbuf.Get(), write_slot, cfg, now.QuadPart);
+                record_capture_commands(g_dx12.cmd_list.Get(), backbuf.Get(), write_slot, cfg, now_qpc);
             }
             if (overlay) {
                 record_overlay_commands(g_dx12.cmd_list.Get(), backbuf.Get(), fps,

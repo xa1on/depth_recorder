@@ -1,7 +1,5 @@
 #include "gl_hook.h"
-#include "common/config.h"
-#include "common/ipc_ring.h"
-#include "depth_heuristic.h"
+#include "hook_common.h"
 #include "fps_overlay_font.h"
 
 #include <MinHook.h>
@@ -578,11 +576,9 @@ void copy_pbo_flipped(GLuint pbo, uint32_t w, uint32_t h, uint32_t bpp, std::vec
 void draw_fps_overlay(double fps, bool recording, OverlayCorner corner) {
     if (!g_gl.overlay_prog || g_gl.width == 0 || g_gl.height == 0) return;
 
-    char text[32]{};
-    std::snprintf(text, sizeof(text), "%.0f", fps);
     std::vector<uint8_t> rgba;
     uint32_t bw = 0, bh = 0;
-    render_fps_bitmap(text, recording, rgba, bw, bh);
+    render_fps_overlay_rgba(fps, recording, rgba, bw, bh);
 
     GlStateGuard guard;
 
@@ -598,20 +594,8 @@ void draw_fps_overlay(double fps, bool recording, OverlayCorner corner) {
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, static_cast<GLsizei>(bw), static_cast<GLsizei>(bh),
                     GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
 
-    const float pad_px = 12.0f;
-    const float w_ndc = (2.0f * bw) / static_cast<float>(g_gl.width);
-    const float h_ndc = (2.0f * bh) / static_cast<float>(g_gl.height);
-    const float px_ndc = (2.0f * pad_px) / static_cast<float>(g_gl.width);
-    const float py_ndc = (2.0f * pad_px) / static_cast<float>(g_gl.height);
-
-    float x0 = -1.0f + px_ndc;
-    float y1 = 1.0f - py_ndc;
-    if (corner == OverlayCorner::TopRight || corner == OverlayCorner::BottomRight) {
-        x0 = 1.0f - px_ndc - w_ndc;
-    }
-    if (corner == OverlayCorner::BottomLeft || corner == OverlayCorner::BottomRight) {
-        y1 = -1.0f + py_ndc + h_ndc;
-    }
+    float ndc_rect[4]{};
+    compute_overlay_ndc_rect(bw, bh, g_gl.width, g_gl.height, corner, ndc_rect);
 
     g_gl_fn.BindFramebuffer(kGL_DRAW_FRAMEBUFFER, 0);
     glViewport(0, 0, static_cast<GLsizei>(g_gl.width), static_cast<GLsizei>(g_gl.height));
@@ -622,7 +606,7 @@ void draw_fps_overlay(double fps, bool recording, OverlayCorner corner) {
     g_gl_fn.BlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ZERO);
 
     g_gl_fn.UseProgram(g_gl.overlay_prog);
-    g_gl_fn.Uniform4f(g_gl.loc_overlay_rect, x0, y1 - h_ndc, x0 + w_ndc, y1);
+    g_gl_fn.Uniform4f(g_gl.loc_overlay_rect, ndc_rect[0], ndc_rect[1], ndc_rect[2], ndc_rect[3]);
     g_gl_fn.Uniform1i(g_gl.loc_overlay_tex, 0);
     g_gl_fn.BindVertexArray(g_gl.dummy_vao);
     glDrawArrays(GL_TRIANGLES, 0, 6);
@@ -640,20 +624,10 @@ void capture_frame(SharedConfig* cfg, int64_t now_qpc) {
             copy_pbo_flipped(g_gl.depth_pbo[read_slot], g_gl.width, g_gl.height, bpp, g_gl.depth_pack_buf);
             depth_bytes = static_cast<uint32_t>(g_gl.depth_pack_buf.size());
         }
-        FrameHeader hdr{};
-        hdr.frame_index = g_gl.frame_idx;
-        hdr.qpc_timestamp = g_gl.slot_qpc[read_slot];
-        hdr.qpc_freq = g_gl.qpc_freq;
-        hdr.width = g_gl.width;
-        hdr.height = g_gl.height;
-        hdr.color_bytes = static_cast<uint32_t>(g_gl.color_pack_buf.size());
-        hdr.depth_bytes = depth_bytes;
-        hdr.depth_mode = g_gl.slot_mode[read_slot];
-        hdr.has_depth = g_gl.slot_has_depth[read_slot] ? 1 : 0;
-
-        if (!g_ipc_ring.try_push(hdr, g_gl.color_pack_buf.data(), depth_bytes ? g_gl.depth_pack_buf.data() : nullptr)) {
-            if (cfg) InterlockedIncrement(&cfg->dropped_frames);
-        }
+        push_frame_to_ring(g_ipc_ring, cfg, g_gl.frame_idx, g_gl.slot_qpc[read_slot], g_gl.qpc_freq,
+                           g_gl.width, g_gl.height, g_gl.slot_mode[read_slot], g_gl.slot_has_depth[read_slot],
+                           g_gl.color_pack_buf.data(), static_cast<uint32_t>(g_gl.color_pack_buf.size()),
+                           g_gl.depth_pack_buf.data(), depth_bytes);
         g_gl.slot_pending[read_slot] = false;
     }
 
@@ -673,17 +647,10 @@ void capture_frame(SharedConfig* cfg, int64_t now_qpc) {
     const uint32_t mode = cfg ? static_cast<uint32_t>(cfg->depth_mode) : static_cast<uint32_t>(DepthMode::Rgb24Lossless);
     bool captured_depth = false;
 
-    const auto ranked = g_gl.heuristic.ranked_candidates();
-    if (cfg) {
-        InterlockedExchange(&cfg->candidate_depth_count, static_cast<LONG>(ranked.size()));
-        if (!ranked.empty()) {
-            g_gl.selected_depth_idx %= static_cast<uint32_t>(ranked.size());
-            InterlockedExchange(&cfg->selected_depth_index, static_cast<LONG>(g_gl.selected_depth_idx));
-        }
-    }
+    DepthCandidate cand{};
+    const bool has_cand = select_depth_candidate(g_gl.heuristic.ranked_candidates(), cfg, g_gl.selected_depth_idx, cand);
 
-    if (want_depth && !ranked.empty() && g_gl.depth_prog && g_gl.depth_conv_fbo) {
-        const auto& cand = ranked[g_gl.selected_depth_idx % ranked.size()];
+    if (want_depth && has_cand && g_gl.depth_prog && g_gl.depth_conv_fbo) {
         GLuint depth_tex = 0;
         if (g_gl.clear_snap_valid_this_frame && g_gl.clear_snap_key == cand.key && g_gl.clear_snap_tex) {
             depth_tex = g_gl.clear_snap_tex;
@@ -780,35 +747,14 @@ BOOL WINAPI hkWglSwapBuffers(HDC hdc) {
         const bool selected = !g_config_view.get() ||
             register_and_is_selected_swapchain(g_config_view.get(), reinterpret_cast<uint64_t>(hwnd ? hwnd : reinterpret_cast<HWND>(hdc)), w, h, hwnd);
         if (selected && ensure_pipeline(hdc)) {
-            LARGE_INTEGER now{};
-            QueryPerformanceCounter(&now);
-            double fps = 60.0;
-            if (g_gl.last_qpc != 0 && g_gl.qpc_freq > 0) {
-                const double dt = static_cast<double>(now.QuadPart - g_gl.last_qpc) / static_cast<double>(g_gl.qpc_freq);
-                if (dt > 1e-5) fps = 1.0 / dt;
-            }
-            g_gl.last_qpc = now.QuadPart;
-
-            if (!g_config_view.get()) g_config_view.open_or_create(false);
-            if (!g_ipc_ring.event_handle()) {
-                if (!g_ipc_ring.open_or_create(false) && g_config_view.get()) {
-                    InterlockedExchange(&g_config_view.get()->dropped_frames, static_cast<LONG>(GetLastError()) + 100000);
-                }
-            }
-
+            ensure_ipc_connected(g_config_view, g_ipc_ring);
             SharedConfig* cfg = g_config_view.get();
-            if (cfg) {
-                InterlockedExchange(&cfg->hooked_pid, static_cast<LONG>(GetCurrentProcessId()));
-                InterlockedExchange(&cfg->active_backend, 2);
-                InterlockedExchange(&cfg->current_fps_x10, static_cast<LONG>(fps * 10.0));
-                if (cfg->cycle_depth_seq != g_gl.last_cycle_seq) {
-                    g_gl.last_cycle_seq = cfg->cycle_depth_seq;
-                    g_gl.selected_depth_idx++;
-                }
-            }
+            int64_t now_qpc = 0;
+            const double fps = tick_fps_and_telemetry(cfg, 2, g_gl.last_qpc, g_gl.qpc_freq,
+                                                      g_gl.last_cycle_seq, g_gl.selected_depth_idx, now_qpc);
 
             if (cfg && (cfg->recording != 0 || cfg->preview_enabled != 0) && g_ipc_ring.event_handle()) {
-                capture_frame(cfg, now.QuadPart);
+                capture_frame(cfg, now_qpc);
             } else {
                 for (bool& p : g_gl.slot_pending) p = false;
             }

@@ -1,8 +1,6 @@
 #include "dx11_hook.h"
 #include "dx12_hook.h"
-#include "common/config.h"
-#include "common/ipc_ring.h"
-#include "depth_heuristic.h"
+#include "hook_common.h"
 #include "fps_overlay_font.h"
 
 #include "depth_convert_cs.h"
@@ -32,17 +30,6 @@ extern IpcRing g_ipc_ring;
 namespace {
 
 constexpr uint32_t kStagingSlots = 3;
-
-struct DepthConvertParams {
-    uint32_t width;
-    uint32_t height;
-    uint32_t mode;
-    uint32_t linearize;
-    uint32_t reversed_z;
-    float z_near;
-    float z_far;
-    float pad;
-};
 
 struct OverlayRectCB {
     float ndc_rect[4];
@@ -312,11 +299,9 @@ void draw_fps_overlay(IDXGISwapChain* swap, double fps, bool recording, OverlayC
     ComPtr<ID3D11RenderTargetView> rtv;
     if (FAILED(g_dx11.device->CreateRenderTargetView(backbuf.Get(), nullptr, rtv.GetAddressOf()))) return;
 
-    char text[32]{};
-    std::snprintf(text, sizeof(text), "%.0f", fps);
     std::vector<uint8_t> rgba;
     uint32_t bw = 0, bh = 0;
-    render_fps_bitmap(text, recording, rgba, bw, bh);
+    render_fps_overlay_rgba(fps, recording, rgba, bw, bh);
 
     if (!g_dx11.font_tex || g_dx11.font_w != bw || g_dx11.font_h != bh) {
         g_dx11.font_tex.Reset();
@@ -347,26 +332,12 @@ void draw_fps_overlay(IDXGISwapChain* swap, double fps, bool recording, OverlayC
         g_dx11.ctx->Unmap(g_dx11.font_tex.Get(), 0);
     }
 
-    const float pad_px = 12.0f;
-    const float w_ndc = (2.0f * bw) / static_cast<float>(g_dx11.width);
-    const float h_ndc = (2.0f * bh) / static_cast<float>(g_dx11.height);
-    const float px_ndc = (2.0f * pad_px) / static_cast<float>(g_dx11.width);
-    const float py_ndc = (2.0f * pad_px) / static_cast<float>(g_dx11.height);
-
-    float x0 = -1.0f + px_ndc, y1 = 1.0f - py_ndc;
-    if (corner == OverlayCorner::TopRight || corner == OverlayCorner::BottomRight) {
-        x0 = 1.0f - px_ndc - w_ndc;
-    }
-    if (corner == OverlayCorner::BottomLeft || corner == OverlayCorner::BottomRight) {
-        y1 = -1.0f + py_ndc + h_ndc;
-    }
+    float ndc_rect[4]{};
+    compute_overlay_ndc_rect(bw, bh, g_dx11.width, g_dx11.height, corner, ndc_rect);
 
     if (SUCCEEDED(g_dx11.ctx->Map(g_dx11.cb_overlay.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
         auto* cb = static_cast<OverlayRectCB*>(m.pData);
-        cb->ndc_rect[0] = x0;
-        cb->ndc_rect[1] = y1 - h_ndc;
-        cb->ndc_rect[2] = x0 + w_ndc;
-        cb->ndc_rect[3] = y1;
+        std::memcpy(cb->ndc_rect, ndc_rect, sizeof(ndc_rect));
         g_dx11.ctx->Unmap(g_dx11.cb_overlay.Get(), 0);
     }
 
@@ -406,20 +377,10 @@ void capture_frame(IDXGISwapChain* swap, SharedConfig* cfg, int64_t now_qpc) {
             copy_staging_tight(g_dx11.depth_staging[read_slot].Get(), g_dx11.width, g_dx11.height, bpp, g_dx11.depth_pack_buf);
             depth_bytes = static_cast<uint32_t>(g_dx11.depth_pack_buf.size());
         }
-        FrameHeader hdr{};
-        hdr.frame_index = g_dx11.frame_idx;
-        hdr.qpc_timestamp = g_dx11.slot_qpc[read_slot];
-        hdr.qpc_freq = g_dx11.qpc_freq;
-        hdr.width = g_dx11.width;
-        hdr.height = g_dx11.height;
-        hdr.color_bytes = static_cast<uint32_t>(g_dx11.color_pack_buf.size());
-        hdr.depth_bytes = depth_bytes;
-        hdr.depth_mode = g_dx11.slot_mode[read_slot];
-        hdr.has_depth = g_dx11.slot_has_depth[read_slot] ? 1 : 0;
-
-        if (!g_ipc_ring.try_push(hdr, g_dx11.color_pack_buf.data(), depth_bytes ? g_dx11.depth_pack_buf.data() : nullptr)) {
-            if (cfg) InterlockedIncrement(&cfg->dropped_frames);
-        }
+        push_frame_to_ring(g_ipc_ring, cfg, g_dx11.frame_idx, g_dx11.slot_qpc[read_slot], g_dx11.qpc_freq,
+                           g_dx11.width, g_dx11.height, g_dx11.slot_mode[read_slot], g_dx11.slot_has_depth[read_slot],
+                           g_dx11.color_pack_buf.data(), static_cast<uint32_t>(g_dx11.color_pack_buf.size()),
+                           g_dx11.depth_pack_buf.data(), depth_bytes);
         g_dx11.slot_pending[read_slot] = false;
     }
 
@@ -433,17 +394,10 @@ void capture_frame(IDXGISwapChain* swap, SharedConfig* cfg, int64_t now_qpc) {
     const uint32_t mode = cfg ? static_cast<uint32_t>(cfg->depth_mode) : static_cast<uint32_t>(DepthMode::Rgb24Lossless);
     bool captured_depth = false;
 
-    const auto ranked = g_dx11.heuristic.ranked_candidates();
-    if (cfg) {
-        InterlockedExchange(&cfg->candidate_depth_count, static_cast<LONG>(ranked.size()));
-        if (!ranked.empty()) {
-            g_dx11.selected_depth_idx %= static_cast<uint32_t>(ranked.size());
-            InterlockedExchange(&cfg->selected_depth_index, static_cast<LONG>(g_dx11.selected_depth_idx));
-        }
-    }
+    DepthCandidate cand{};
+    const bool has_cand = select_depth_candidate(g_dx11.heuristic.ranked_candidates(), cfg, g_dx11.selected_depth_idx, cand);
 
-    if (want_depth && !ranked.empty() && g_dx11.cs_depth) {
-        const auto& cand = ranked[g_dx11.selected_depth_idx % ranked.size()];
+    if (want_depth && has_cand && g_dx11.cs_depth) {
         ID3D11Texture2D* src_tex = reinterpret_cast<ID3D11Texture2D*>(cand.key);
         if (g_dx11.clear_snap_valid_this_frame && g_dx11.clear_snap_key == cand.key && g_dx11.clear_snap_tex) {
             src_tex = g_dx11.clear_snap_tex.Get();
@@ -540,35 +494,14 @@ HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swap, UINT sync, UINT flags)
             register_and_is_selected_swapchain(g_config_view.get(), reinterpret_cast<uint64_t>(swap),
                                                scd.BufferDesc.Width, scd.BufferDesc.Height, scd.OutputWindow));
         if (selected && ensure_pipeline(swap)) {
-            LARGE_INTEGER now{};
-            QueryPerformanceCounter(&now);
-            double fps = 60.0;
-            if (g_dx11.last_qpc != 0 && g_dx11.qpc_freq > 0) {
-                const double dt = static_cast<double>(now.QuadPart - g_dx11.last_qpc) / static_cast<double>(g_dx11.qpc_freq);
-                if (dt > 1e-5) fps = 1.0 / dt;
-            }
-            g_dx11.last_qpc = now.QuadPart;
-
-            if (!g_config_view.get()) g_config_view.open_or_create(false);
-            if (!g_ipc_ring.event_handle()) {
-                if (!g_ipc_ring.open_or_create(false) && g_config_view.get()) {
-                    InterlockedExchange(&g_config_view.get()->dropped_frames, static_cast<LONG>(GetLastError()) + 100000);
-                }
-            }
-
+            ensure_ipc_connected(g_config_view, g_ipc_ring);
             SharedConfig* cfg = g_config_view.get();
-            if (cfg) {
-                InterlockedExchange(&cfg->hooked_pid, static_cast<LONG>(GetCurrentProcessId()));
-                InterlockedExchange(&cfg->active_backend, 1);
-                InterlockedExchange(&cfg->current_fps_x10, static_cast<LONG>(fps * 10.0));
-                if (cfg->cycle_depth_seq != g_dx11.last_cycle_seq) {
-                    g_dx11.last_cycle_seq = cfg->cycle_depth_seq;
-                    g_dx11.selected_depth_idx++;
-                }
-            }
+            int64_t now_qpc = 0;
+            const double fps = tick_fps_and_telemetry(cfg, 1, g_dx11.last_qpc, g_dx11.qpc_freq,
+                                                      g_dx11.last_cycle_seq, g_dx11.selected_depth_idx, now_qpc);
 
             if (cfg && (cfg->recording != 0 || cfg->preview_enabled != 0) && g_ipc_ring.event_handle()) {
-                capture_frame(swap, cfg, now.QuadPart);
+                capture_frame(swap, cfg, now_qpc);
             } else {
                 for (bool& p : g_dx11.slot_pending) p = false;
             }

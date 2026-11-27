@@ -3,9 +3,7 @@
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_layer.h>
 
-#include "common/config.h"
-#include "common/ipc_ring.h"
-#include "depth_heuristic.h"
+#include "hook_common.h"
 #include "fps_overlay_font.h"
 #include "depth_convert_spv.h"
 
@@ -944,28 +942,11 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_vkQueuePresentKHR(VkQueue queue, const VkPre
             }
 
             if (ensure_resources(dev, w, h, q_fam)) {
-                LARGE_INTEGER now{};
-                QueryPerformanceCounter(&now);
-                double fps = 60.0;
-                if (dev->last_qpc != 0 && dev->qpc_freq > 0) {
-                    const double dt = static_cast<double>(now.QuadPart - dev->last_qpc) / static_cast<double>(dev->qpc_freq);
-                    if (dt > 1e-5) fps = 1.0 / dt;
-                }
-                dev->last_qpc = now.QuadPart;
-
-                if (!g_config_view.get()) g_config_view.open_or_create(false);
-                if (!g_ipc_ring.event_handle()) g_ipc_ring.open_or_create(false);
-
+                dr::ensure_ipc_connected(g_config_view, g_ipc_ring);
                 dr::SharedConfig* cfg = g_config_view.get();
-                if (cfg) {
-                    InterlockedExchange(&cfg->hooked_pid, static_cast<LONG>(GetCurrentProcessId()));
-                    InterlockedExchange(&cfg->active_backend, 3);
-                    InterlockedExchange(&cfg->current_fps_x10, static_cast<LONG>(fps * 10.0));
-                    if (cfg->cycle_depth_seq != dev->last_cycle_seq) {
-                        dev->last_cycle_seq = cfg->cycle_depth_seq;
-                        dev->selected_depth_idx++;
-                    }
-                }
+                int64_t now_qpc = 0;
+                const double fps = dr::tick_fps_and_telemetry(cfg, 3, dev->last_qpc, dev->qpc_freq,
+                                                              dev->last_cycle_seq, dev->selected_depth_idx, now_qpc);
 
                 const bool recording = (cfg && (cfg->recording != 0 || cfg->preview_enabled != 0) && g_ipc_ring.event_handle());
                 const bool overlay = (cfg && cfg->overlay_enabled != 0);
@@ -996,20 +977,10 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_vkQueuePresentKHR(VkQueue queue, const VkPre
                         std::memcpy(dev->depth_pack_buf.data(), dev->depth_mapped[read_slot], depth_bytes);
                     }
 
-                    dr::FrameHeader hdr{};
-                    hdr.frame_index = dev->frame_idx;
-                    hdr.qpc_timestamp = dev->slot_qpc[read_slot];
-                    hdr.qpc_freq = dev->qpc_freq;
-                    hdr.width = w;
-                    hdr.height = h;
-                    hdr.color_bytes = static_cast<uint32_t>(color_bytes);
-                    hdr.depth_bytes = depth_bytes;
-                    hdr.depth_mode = dev->slot_mode[read_slot];
-                    hdr.has_depth = dev->slot_has_depth[read_slot] ? 1 : 0;
-
-                    if (!g_ipc_ring.try_push(hdr, dev->color_pack_buf.data(), depth_bytes ? dev->depth_pack_buf.data() : nullptr)) {
-                        if (cfg) InterlockedIncrement(&cfg->dropped_frames);
-                    }
+                    dr::push_frame_to_ring(g_ipc_ring, cfg, dev->frame_idx, dev->slot_qpc[read_slot], dev->qpc_freq,
+                                           w, h, dev->slot_mode[read_slot], dev->slot_has_depth[read_slot],
+                                           dev->color_pack_buf.data(), static_cast<uint32_t>(color_bytes),
+                                           dev->depth_pack_buf.data(), depth_bytes);
                     dev->slot_pending[read_slot] = false;
                 } else if (!recording) {
                     for (bool& p : dev->slot_pending) p = false;
@@ -1048,15 +1019,10 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_vkQueuePresentKHR(VkQueue queue, const VkPre
                         const uint32_t mode = static_cast<uint32_t>(cfg->depth_mode);
                         bool captured_depth = false;
 
-                        const auto ranked = dev->heuristic.ranked_candidates();
-                        InterlockedExchange(&cfg->candidate_depth_count, static_cast<LONG>(ranked.size()));
-                        if (!ranked.empty()) {
-                            dev->selected_depth_idx %= static_cast<uint32_t>(ranked.size());
-                            InterlockedExchange(&cfg->selected_depth_index, static_cast<LONG>(dev->selected_depth_idx));
-                        }
+                        dr::DepthCandidate cand{};
+                        const bool has_cand = dr::select_depth_candidate(dev->heuristic.ranked_candidates(), cfg, dev->selected_depth_idx, cand);
 
-                        if (want_depth && !ranked.empty()) {
-                            const auto& cand = ranked[dev->selected_depth_idx % ranked.size()];
+                        if (want_depth && has_cand) {
                             VkImage depth_img = reinterpret_cast<VkImage>(cand.key);
                             auto iit = dev->images.find(depth_img);
                             if (iit != dev->images.end()) {
@@ -1112,7 +1078,7 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_vkQueuePresentKHR(VkQueue queue, const VkPre
                             }
                         }
 
-                        dev->slot_qpc[write_slot] = now.QuadPart;
+                        dev->slot_qpc[write_slot] = now_qpc;
                         dev->slot_mode[write_slot] = mode;
                         dev->slot_has_depth[write_slot] = captured_depth;
                         dev->slot_depth_bpp[write_slot] = (mode == static_cast<uint32_t>(dr::DepthMode::Gray8)) ? 1u : 4u;
@@ -1121,11 +1087,9 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_vkQueuePresentKHR(VkQueue queue, const VkPre
                     }
 
                     if (overlay) {
-                        char text[32]{};
-                        std::snprintf(text, sizeof(text), "%.0f", fps);
                         std::vector<uint8_t> rgba;
                         uint32_t bw = 0, bh = 0;
-                        dr::render_fps_bitmap(text, cfg->recording != 0, rgba, bw, bh);
+                        dr::render_fps_overlay_rgba(fps, cfg->recording != 0, rgba, bw, bh);
 
                         if (bw <= w && bh <= h && ensure_overlay_image(dev, bw, bh)) {
                             std::memcpy(dev->overlay_buf_mapped, rgba.data(), rgba.size());
@@ -1151,16 +1115,10 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_vkQueuePresentKHR(VkQueue queue, const VkPre
                                         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
                             swap_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
 
-                            const int32_t pad = 12;
-                            int32_t dx = pad;
-                            int32_t dy = pad;
-                            const auto corner = static_cast<dr::OverlayCorner>(cfg->overlay_corner);
-                            if (corner == dr::OverlayCorner::TopRight || corner == dr::OverlayCorner::BottomRight) {
-                                dx = std::max<int32_t>(0, static_cast<int32_t>(w) - static_cast<int32_t>(bw) - pad);
-                            }
-                            if (corner == dr::OverlayCorner::BottomLeft || corner == dr::OverlayCorner::BottomRight) {
-                                dy = std::max<int32_t>(0, static_cast<int32_t>(h) - static_cast<int32_t>(bh) - pad);
-                            }
+                            int32_t dx = 0, dy = 0;
+                            dr::compute_overlay_pixel_rect(bw, bh, w, h, static_cast<dr::OverlayCorner>(cfg->overlay_corner), dx, dy);
+                            dx = std::max<int32_t>(0, dx);
+                            dy = std::max<int32_t>(0, dy);
 
                             VkImageBlit blit{};
                             blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
