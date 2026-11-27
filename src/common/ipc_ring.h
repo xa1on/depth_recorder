@@ -19,10 +19,13 @@ struct FrameHeader {
     int64_t  qpc_freq;
     uint32_t width;
     uint32_t height;
-    uint32_t color_bytes;   // BGRA8: width * height * 4
+    uint32_t color_bytes;   // BGRA8 or RGBA8: width * height * 4 (0 if is_preview_only)
     uint32_t depth_bytes;   // 0 if !has_depth; width * height * (1 or 4)
     uint32_t depth_mode;    // DepthMode
     uint32_t has_depth;
+    uint8_t  color_is_rgba; // 1 = RGBA8, 0 = BGRA8
+    uint8_t  is_preview_only; // 1 = idle depth-only preview frame
+    uint8_t  reserved[2]{};
 };
 
 struct RingControlBlock {

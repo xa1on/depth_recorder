@@ -3,8 +3,10 @@
 #include "common/ipc_ring.h"
 #include "depth_heuristic.h"
 #include "fps_overlay_font.h"
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 
 namespace dr {
 
@@ -57,24 +59,37 @@ inline bool select_depth_candidate(const std::vector<DepthCandidate>& ranked, Sh
     return true;
 }
 
+inline bool should_capture_preview_now(int64_t now_qpc, int64_t qpc_freq, int64_t& last_preview_qpc) {
+    if (qpc_freq <= 0) return true;
+    if (last_preview_qpc == 0 || (now_qpc - last_preview_qpc) >= (qpc_freq / 6)) {
+        last_preview_qpc = now_qpc;
+        return true;
+    }
+    return false;
+}
+
 inline void push_frame_to_ring(IpcRing& ring, SharedConfig* cfg, uint64_t frame_idx,
                                int64_t qpc_ts, int64_t qpc_freq, uint32_t w, uint32_t h,
                                uint32_t mode, bool has_depth,
                                const void* color_data, uint32_t color_bytes,
-                               const void* depth_data, uint32_t depth_bytes) {
+                               const void* depth_data, uint32_t depth_bytes,
+                               bool color_is_rgba = false, bool is_preview_only = false) {
     FrameHeader hdr{};
     hdr.frame_index = frame_idx;
     hdr.qpc_timestamp = qpc_ts;
     hdr.qpc_freq = qpc_freq;
     hdr.width = w;
     hdr.height = h;
-    hdr.color_bytes = color_bytes;
+    hdr.color_bytes = is_preview_only ? 0 : color_bytes;
     hdr.depth_bytes = has_depth ? depth_bytes : 0;
     hdr.depth_mode = mode;
     hdr.has_depth = has_depth ? 1 : 0;
+    hdr.color_is_rgba = color_is_rgba ? 1 : 0;
+    hdr.is_preview_only = is_preview_only ? 1 : 0;
 
-    if (!ring.try_push(hdr, color_data, (has_depth && depth_bytes > 0) ? depth_data : nullptr)) {
-        if (cfg) InterlockedIncrement(&cfg->dropped_frames);
+    if (!ring.try_push(hdr, hdr.color_bytes ? color_data : nullptr,
+                       (has_depth && depth_bytes > 0) ? depth_data : nullptr)) {
+        if (cfg && !is_preview_only) InterlockedIncrement(&cfg->dropped_frames);
     }
 }
 
@@ -107,11 +122,35 @@ inline void compute_overlay_ndc_rect(uint32_t bw, uint32_t bh, uint32_t view_w, 
     out_ndc[3] = y1;
 }
 
-inline void render_fps_overlay_rgba(double fps, bool recording,
+inline void render_fps_overlay_rgba(double fps, double rec_fps, bool recording,
                                     std::vector<uint8_t>& out_rgba, uint32_t& out_bw, uint32_t& out_bh) {
-    char text[32]{};
-    std::snprintf(text, sizeof(text), "%.0f", fps);
+    char text[48]{};
+    if (recording) {
+        std::snprintf(text, sizeof(text), "%.0f - rec: %.0f", fps, rec_fps);
+    } else {
+        std::snprintf(text, sizeof(text), "%.0f", fps);
+    }
     render_fps_bitmap(text, recording, out_rgba, out_bw, out_bh);
+}
+
+inline void swizzle_rgba_to_bgra(uint8_t* bgra, size_t pixel_count) {
+    for (size_t i = 0; i < pixel_count; ++i) {
+        std::swap(bgra[i * 4 + 0], bgra[i * 4 + 2]);
+    }
+}
+
+inline void unpack_r10g10b10a2_to_bgra(const uint8_t* src, uint8_t* dst_bgra, size_t pixel_count, bool bgr_order) {
+    const auto* p32 = reinterpret_cast<const uint32_t*>(src);
+    for (size_t i = 0; i < pixel_count; ++i) {
+        const uint32_t v = p32[i];
+        const uint8_t c0 = static_cast<uint8_t>((v & 0x3FFu) >> 2);
+        const uint8_t c1 = static_cast<uint8_t>(((v >> 10) & 0x3FFu) >> 2);
+        const uint8_t c2 = static_cast<uint8_t>(((v >> 20) & 0x3FFu) >> 2);
+        dst_bgra[i * 4 + 0] = bgr_order ? c0 : c2;
+        dst_bgra[i * 4 + 1] = c1;
+        dst_bgra[i * 4 + 2] = bgr_order ? c2 : c0;
+        dst_bgra[i * 4 + 3] = 255;
+    }
 }
 
 struct DepthConvertParams {

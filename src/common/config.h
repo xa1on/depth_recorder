@@ -37,7 +37,7 @@ struct SharedConfig {
     // Recording state (0 = idle, 1 = recording)
     volatile LONG recording = 0;
     volatile LONG depth_enabled = 1;
-    volatile LONG depth_mode = static_cast<LONG>(DepthMode::Rgb24Lossless);
+    volatile LONG depth_mode = static_cast<LONG>(DepthMode::Gray8);
 
     // Linearization (used for Gray8 / ColorPhase)
     volatile LONG linearize = 1;
@@ -61,6 +61,7 @@ struct SharedConfig {
     volatile LONG candidate_depth_count = 0;
     volatile LONG selected_depth_index = 0;
     volatile LONG current_fps_x10 = 0; // FPS * 10
+    volatile LONG actual_rec_fps_x10 = 0; // Actual unique encoded FPS * 10
     volatile LONG dropped_frames = 0;
 
     SwapchainInfo swapchains[kMaxSwapchains]{};

@@ -16,10 +16,11 @@ struct RecorderAppState {
     VideoEncoder encoder;
     std::wstring output_dir = L".\\recordings";
     std::wstring hook_dll_path;
+    uint32_t recording_fps = 60;
     uint32_t h264_quality = 85;
     std::wstring extra_ffmpeg_flags;
     UINT hotkey_record_vk = VK_F9;
-    UINT hotkey_cycle_vk = VK_F10;
+    UINT hotkey_record_mod = 0;
     std::atomic<bool> running{true};
     std::atomic<bool> stop_requested{false};
 

@@ -12,6 +12,7 @@ struct EncoderSettings {
     bool depth_enabled = true;
     uint32_t fps = 60;
     uint32_t h264_quality = 85; // 1..100
+    bool color_is_rgba = false;
     std::wstring extra_ffmpeg_flags;
 };
 

@@ -200,9 +200,11 @@ struct GlState {
     GLuint depth_pbo[kPboSlots]{};
     uint32_t depth_pbo_bpp[kPboSlots]{};
     bool slot_pending[kPboSlots]{};
+    bool slot_has_color[kPboSlots]{};
     int64_t slot_qpc[kPboSlots]{};
     uint32_t slot_mode[kPboSlots]{};
     bool slot_has_depth[kPboSlots]{};
+    int64_t last_preview_qpc = 0;
 
     // FPS overlay resources
     GLuint overlay_prog = 0;
@@ -573,12 +575,12 @@ void copy_pbo_flipped(GLuint pbo, uint32_t w, uint32_t h, uint32_t bpp, std::vec
     g_gl_fn.BindBuffer(kGL_PIXEL_PACK_BUFFER, 0);
 }
 
-void draw_fps_overlay(double fps, bool recording, OverlayCorner corner) {
+void draw_fps_overlay(double fps, double rec_fps, bool recording, OverlayCorner corner) {
     if (!g_gl.overlay_prog || g_gl.width == 0 || g_gl.height == 0) return;
 
     std::vector<uint8_t> rgba;
     uint32_t bw = 0, bh = 0;
-    render_fps_overlay_rgba(fps, recording, rgba, bw, bh);
+    render_fps_overlay_rgba(fps, rec_fps, recording, rgba, bw, bh);
 
     GlStateGuard guard;
 
@@ -612,12 +614,19 @@ void draw_fps_overlay(double fps, bool recording, OverlayCorner corner) {
     glDrawArrays(GL_TRIANGLES, 0, 6);
 }
 
-void capture_frame(SharedConfig* cfg, int64_t now_qpc) {
+void capture_frame(SharedConfig* cfg, int64_t now_qpc, bool capture_color) {
     GlStateGuard guard;
 
-    const uint32_t read_slot = static_cast<uint32_t>((g_gl.frame_idx + 1) % kPboSlots);
-    if (g_gl.slot_pending[read_slot] && g_gl.color_pbo[read_slot]) {
-        copy_pbo_flipped(g_gl.color_pbo[read_slot], g_gl.width, g_gl.height, 4, g_gl.color_pack_buf);
+    const uint32_t write_slot = static_cast<uint32_t>(g_gl.frame_idx % kPboSlots);
+    for (uint32_t off = 1; off <= kPboSlots; ++off) {
+        const uint32_t read_slot = (write_slot + off) % kPboSlots;
+        if (!g_gl.slot_pending[read_slot]) continue;
+
+        uint32_t color_bytes = 0;
+        if (g_gl.slot_has_color[read_slot] && g_gl.color_pbo[read_slot]) {
+            copy_pbo_flipped(g_gl.color_pbo[read_slot], g_gl.width, g_gl.height, 4, g_gl.color_pack_buf);
+            color_bytes = static_cast<uint32_t>(g_gl.color_pack_buf.size());
+        }
         uint32_t depth_bytes = 0;
         if (g_gl.slot_has_depth[read_slot] && g_gl.depth_pbo[read_slot]) {
             const uint32_t bpp = g_gl.depth_pbo_bpp[read_slot];
@@ -626,22 +635,27 @@ void capture_frame(SharedConfig* cfg, int64_t now_qpc) {
         }
         push_frame_to_ring(g_ipc_ring, cfg, g_gl.frame_idx, g_gl.slot_qpc[read_slot], g_gl.qpc_freq,
                            g_gl.width, g_gl.height, g_gl.slot_mode[read_slot], g_gl.slot_has_depth[read_slot],
-                           g_gl.color_pack_buf.data(), static_cast<uint32_t>(g_gl.color_pack_buf.size()),
-                           g_gl.depth_pack_buf.data(), depth_bytes);
+                           color_bytes ? g_gl.color_pack_buf.data() : nullptr, color_bytes,
+                           depth_bytes ? g_gl.depth_pack_buf.data() : nullptr, depth_bytes,
+                           false, !g_gl.slot_has_color[read_slot]);
         g_gl.slot_pending[read_slot] = false;
     }
 
-    const uint32_t write_slot = static_cast<uint32_t>(g_gl.frame_idx % kPboSlots);
-    GLboolean dbl = GL_FALSE;
-    glGetBooleanv(GL_DOUBLEBUFFER, &dbl);
+    if (capture_color) {
+        GLboolean dbl = GL_FALSE;
+        glGetBooleanv(GL_DOUBLEBUFFER, &dbl);
 
-    g_gl_fn.BindFramebuffer(kGL_READ_FRAMEBUFFER, 0);
-    glReadBuffer(dbl ? GL_BACK : GL_FRONT);
-    glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    g_gl_fn.BindBuffer(kGL_PIXEL_PACK_BUFFER, g_gl.color_pbo[write_slot]);
-    glReadPixels(0, 0, static_cast<GLsizei>(g_gl.width), static_cast<GLsizei>(g_gl.height),
-                 kGL_BGRA, GL_UNSIGNED_BYTE, nullptr);
-    g_gl_fn.BindBuffer(kGL_PIXEL_PACK_BUFFER, 0);
+        g_gl_fn.BindFramebuffer(kGL_READ_FRAMEBUFFER, 0);
+        glReadBuffer(dbl ? GL_BACK : GL_FRONT);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glPixelStorei(0x0D02 /*GL_PACK_ROW_LENGTH*/, 0);
+        glPixelStorei(0x0D03 /*GL_PACK_SKIP_ROWS*/, 0);
+        glPixelStorei(0x0D04 /*GL_PACK_SKIP_PIXELS*/, 0);
+        g_gl_fn.BindBuffer(kGL_PIXEL_PACK_BUFFER, g_gl.color_pbo[write_slot]);
+        glReadPixels(0, 0, static_cast<GLsizei>(g_gl.width), static_cast<GLsizei>(g_gl.height),
+                     kGL_BGRA, GL_UNSIGNED_BYTE, nullptr);
+        g_gl_fn.BindBuffer(kGL_PIXEL_PACK_BUFFER, 0);
+    }
 
     const bool want_depth = (cfg && cfg->depth_enabled != 0);
     const uint32_t mode = cfg ? static_cast<uint32_t>(cfg->depth_mode) : static_cast<uint32_t>(DepthMode::Rgb24Lossless);
@@ -718,6 +732,7 @@ void capture_frame(SharedConfig* cfg, int64_t now_qpc) {
     g_gl.slot_qpc[write_slot] = now_qpc;
     g_gl.slot_mode[write_slot] = mode;
     g_gl.slot_has_depth[write_slot] = captured_depth;
+    g_gl.slot_has_color[write_slot] = capture_color;
     g_gl.slot_pending[write_slot] = true;
 }
 
@@ -753,14 +768,18 @@ BOOL WINAPI hkWglSwapBuffers(HDC hdc) {
             const double fps = tick_fps_and_telemetry(cfg, 2, g_gl.last_qpc, g_gl.qpc_freq,
                                                       g_gl.last_cycle_seq, g_gl.selected_depth_idx, now_qpc);
 
-            if (cfg && (cfg->recording != 0 || cfg->preview_enabled != 0) && g_ipc_ring.event_handle()) {
-                capture_frame(cfg, now_qpc);
-            } else {
+            const bool is_recording = (cfg && cfg->recording != 0 && g_ipc_ring.event_handle() != nullptr);
+            const bool is_preview = (!is_recording && cfg && cfg->preview_enabled != 0 && g_ipc_ring.event_handle() != nullptr &&
+                                     should_capture_preview_now(now_qpc, g_gl.qpc_freq, g_gl.last_preview_qpc));
+            if (is_recording || is_preview) {
+                capture_frame(cfg, now_qpc, is_recording);
+            } else if (!cfg || (cfg->recording == 0 && cfg->preview_enabled == 0)) {
                 for (bool& p : g_gl.slot_pending) p = false;
             }
 
             if (cfg && cfg->overlay_enabled != 0) {
-                draw_fps_overlay(fps, cfg->recording != 0, static_cast<OverlayCorner>(cfg->overlay_corner));
+                const double rec_fps = static_cast<double>(cfg->actual_rec_fps_x10) / 10.0;
+                draw_fps_overlay(fps, rec_fps, cfg->recording != 0, static_cast<OverlayCorner>(cfg->overlay_corner));
             }
 
             g_gl.frame_idx++;

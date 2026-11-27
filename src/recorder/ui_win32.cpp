@@ -4,6 +4,7 @@
 #include <cmath>
 #include <commctrl.h>
 #include <commdlg.h>
+#include <filesystem>
 #include <shlobj.h>
 #include <vector>
 
@@ -13,7 +14,6 @@ namespace {
 
 enum ControlId : int {
     IDC_PROC_COMBO = 101,
-    IDC_BTN_REFRESH = 102,
     IDC_BTN_ATTACH = 103,
     IDC_BTN_LAUNCH = 104,
     IDC_EDIT_OUTDIR = 105,
@@ -29,7 +29,6 @@ enum ControlId : int {
     IDC_LBL_STATUS = 115,
     IDC_TAB_MAIN = 116,
     IDC_HK_RECORD = 117,
-    IDC_HK_CYCLE = 118,
     IDC_BTN_APPLY_HK = 119,
     IDC_EDIT_ZNEAR = 120,
     IDC_EDIT_ZFAR = 121,
@@ -43,10 +42,10 @@ enum ControlId : int {
     IDC_SLIDER_QUAL = 129,
     IDC_LBL_QUAL = 130,
     IDC_EDIT_FFMPEG = 131,
+    IDC_RECFPS_COMBO = 132,
 };
 
 constexpr int kHotkeyRecordId = 1;
-constexpr int kHotkeyCycleId = 2;
 constexpr UINT_PTR kTimerId = 1;
 
 struct UiContext {
@@ -56,11 +55,58 @@ struct UiContext {
     std::vector<ProcessEntry> procs;
     std::vector<HWND> capture_ctrls;
     std::vector<HWND> settings_ctrls;
-    UINT rec_mod = 0;
-    UINT cyc_mod = 0;
     LONG last_auto_backend = 0;
     LONG last_swapchain_count = -1;
 };
+
+std::wstring get_ini_path() {
+    wchar_t exe_path[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
+    return (std::filesystem::path(exe_path).parent_path() / L"depth_recorder.ini").wstring();
+}
+
+void load_settings_ini(RecorderAppState& app, SharedConfig* cfg) {
+    const std::wstring ini = get_ini_path();
+    wchar_t buf[512]{};
+    if (GetPrivateProfileStringW(L"Settings", L"OutputDir", L".\\recordings", buf, 512, ini.c_str()) > 0) {
+        app.output_dir = buf;
+    }
+    if (GetPrivateProfileStringW(L"Settings", L"ExtraFFmpegFlags", L"", buf, 512, ini.c_str()) >= 0) {
+        app.extra_ffmpeg_flags = buf;
+    }
+    app.recording_fps = std::clamp<uint32_t>(GetPrivateProfileIntW(L"Settings", L"RecordingFPS", 60, ini.c_str()), 1, 240);
+    app.h264_quality = std::clamp<uint32_t>(GetPrivateProfileIntW(L"Settings", L"H264Quality", 85, ini.c_str()), 1, 100);
+    app.hotkey_record_vk = static_cast<UINT>(GetPrivateProfileIntW(L"Settings", L"RecordHotkeyVK", VK_F9, ini.c_str()));
+    app.hotkey_record_mod = static_cast<UINT>(GetPrivateProfileIntW(L"Settings", L"RecordHotkeyMod", 0, ini.c_str()));
+
+    if (cfg) {
+        const UINT dm = std::min<UINT>(GetPrivateProfileIntW(L"Settings", L"DepthMode", 0, ini.c_str()), 2);
+        InterlockedExchange(&cfg->depth_mode, static_cast<LONG>(dm));
+        InterlockedExchange(&cfg->depth_enabled, GetPrivateProfileIntW(L"Settings", L"DepthEnabled", 1, ini.c_str()) ? 1 : 0);
+        InterlockedExchange(&cfg->overlay_enabled, GetPrivateProfileIntW(L"Settings", L"OverlayEnabled", 1, ini.c_str()) ? 1 : 0);
+        const UINT oc = std::min<UINT>(GetPrivateProfileIntW(L"Settings", L"OverlayCorner", 0, ini.c_str()), 3);
+        InterlockedExchange(&cfg->overlay_corner, static_cast<LONG>(oc));
+        const LONG pv = GetPrivateProfileIntW(L"Settings", L"PreviewEnabled", 1, ini.c_str()) ? 1 : 0;
+        InterlockedExchange(&cfg->preview_enabled, (cfg->depth_enabled && pv) ? 1 : 0);
+    }
+}
+
+void save_settings_ini(const RecorderAppState& app, const SharedConfig* cfg) {
+    const std::wstring ini = get_ini_path();
+    WritePrivateProfileStringW(L"Settings", L"OutputDir", app.output_dir.c_str(), ini.c_str());
+    WritePrivateProfileStringW(L"Settings", L"ExtraFFmpegFlags", app.extra_ffmpeg_flags.c_str(), ini.c_str());
+    WritePrivateProfileStringW(L"Settings", L"RecordingFPS", std::to_wstring(app.recording_fps).c_str(), ini.c_str());
+    WritePrivateProfileStringW(L"Settings", L"H264Quality", std::to_wstring(app.h264_quality).c_str(), ini.c_str());
+    WritePrivateProfileStringW(L"Settings", L"RecordHotkeyVK", std::to_wstring(app.hotkey_record_vk).c_str(), ini.c_str());
+    WritePrivateProfileStringW(L"Settings", L"RecordHotkeyMod", std::to_wstring(app.hotkey_record_mod).c_str(), ini.c_str());
+    if (cfg) {
+        WritePrivateProfileStringW(L"Settings", L"DepthMode", std::to_wstring(cfg->depth_mode).c_str(), ini.c_str());
+        WritePrivateProfileStringW(L"Settings", L"DepthEnabled", cfg->depth_enabled ? L"1" : L"0", ini.c_str());
+        WritePrivateProfileStringW(L"Settings", L"OverlayEnabled", cfg->overlay_enabled ? L"1" : L"0", ini.c_str());
+        WritePrivateProfileStringW(L"Settings", L"OverlayCorner", std::to_wstring(cfg->overlay_corner).c_str(), ini.c_str());
+        WritePrivateProfileStringW(L"Settings", L"PreviewEnabled", cfg->preview_enabled ? L"1" : L"0", ini.c_str());
+    }
+}
 
 void populate_processes(UiContext* ctx) {
     HWND combo = GetDlgItem(ctx->hwnd, IDC_PROC_COMBO);
@@ -94,9 +140,16 @@ UINT hk_mods_to_win32(BYTE hk_mods) {
     return m;
 }
 
+BYTE win32_mods_to_hk(UINT mods) {
+    BYTE m = 0;
+    if (mods & MOD_ALT) m |= HOTKEYF_ALT;
+    if (mods & MOD_CONTROL) m |= HOTKEYF_CONTROL;
+    if (mods & MOD_SHIFT) m |= HOTKEYF_SHIFT;
+    return m;
+}
+
 float slider_to_znear(int pos) {
-    const float t = static_cast<float>(pos) / 1000.0f;
-    return 0.01f * std::pow(1000.0f, t); // [0.01, 10.0]
+    return 0.01f * std::pow(1000.0f, static_cast<float>(pos) / 1000.0f);
 }
 
 int znear_to_slider(float zn) {
@@ -105,8 +158,7 @@ int znear_to_slider(float zn) {
 }
 
 float slider_to_zfar(int pos) {
-    const float t = static_cast<float>(pos) / 1000.0f;
-    return 10.0f * std::pow(1000.0f, t); // [10.0, 10000.0]
+    return 10.0f * std::pow(1000.0f, static_cast<float>(pos) / 1000.0f);
 }
 
 int zfar_to_slider(float zf) {
@@ -156,7 +208,6 @@ void run_auto_config(UiContext* ctx, bool initial_attach) {
             const uint8_t p15 = lumas[lumas.size() * 15 / 100];
             const uint8_t p50 = lumas[lumas.size() / 2];
             const uint8_t p85 = lumas[lumas.size() * 85 / 100];
-            // Adjust Z-Near / Z-Far empirically if the depth histogram is crushed black or washed white
             if (p50 > 215 && p15 > 150) {
                 zf = std::clamp(zf * 0.45f, 15.0f, 10000.0f);
                 zn = std::clamp(zn * 1.5f, 0.01f, 5.0f);
@@ -213,6 +264,13 @@ void sync_ui_to_config(UiContext* ctx) {
         if (zf > cfg->z_near) cfg->z_far = zf;
     }
 
+    wchar_t fpsbuf[16]{};
+    GetWindowTextW(GetDlgItem(ctx->hwnd, IDC_RECFPS_COMBO), fpsbuf, 16);
+    if (fpsbuf[0]) {
+        const uint32_t f = static_cast<uint32_t>(_wtoi(fpsbuf));
+        if (f >= 1 && f <= 240) ctx->app->recording_fps = f;
+    }
+
     ctx->app->h264_quality = static_cast<uint32_t>(SendMessageW(GetDlgItem(ctx->hwnd, IDC_SLIDER_QUAL), TBM_GETPOS, 0, 0));
     wchar_t ffbuf[256]{};
     GetWindowTextW(GetDlgItem(ctx->hwnd, IDC_EDIT_FFMPEG), ffbuf, 256);
@@ -225,7 +283,7 @@ void toggle_recording(UiContext* ctx) {
     if (!cfg) return;
     const LONG next = (cfg->recording == 0) ? 1 : 0;
     InterlockedExchange(&cfg->recording, next);
-    SetWindowTextW(GetDlgItem(ctx->hwnd, IDC_BTN_RECORD), next ? L"Stop Recording (F9)" : L"Start Recording (F9)");
+    SetWindowTextW(GetDlgItem(ctx->hwnd, IDC_BTN_RECORD), next ? L"Stop Recording" : L"Start Recording");
 }
 
 void update_status(UiContext* ctx) {
@@ -239,10 +297,12 @@ void update_status(UiContext* ctx) {
         case 4: backend = L"DX12"; break;
     }
     wchar_t buf[256]{};
-    swprintf_s(buf, L"State: %s | Backend: %s (PID %ld) | FPS: %.1f | Depth: %ld/%ld | Frames: %llu",
-               cfg->recording ? L"RECORDING" : L"Idle",
+    swprintf_s(buf, L"State: %s | %s (PID %ld) | FPS: %.0f | Rec: %.0f/%u | Depth: %ld/%ld | Frames: %llu",
+               cfg->recording ? L"REC" : L"Idle",
                backend, cfg->hooked_pid,
                static_cast<double>(cfg->current_fps_x10) / 10.0,
+               static_cast<double>(cfg->actual_rec_fps_x10) / 10.0,
+               ctx->app->recording_fps,
                cfg->candidate_depth_count > 0 ? (cfg->selected_depth_index + 1) : 0,
                cfg->candidate_depth_count,
                static_cast<unsigned long long>(ctx->app->encoder.frames_written()));
@@ -265,11 +325,14 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             ctx->hwnd = hwnd;
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(ctx));
 
+            load_settings_ini(*ctx->app, ctx->app->config_view.get());
+            SharedConfig* cfg = ctx->app->config_view.get();
+
             NONCLIENTMETRICSW ncm{sizeof(ncm)};
             SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
             ctx->font = CreateFontIndirectW(&ncm.lfMessageFont);
 
-            HWND tab = add_ctrl(hwnd, ctx->font, WC_TABCONTROLW, L"", 0, 8, 6, 614, 308, IDC_TAB_MAIN);
+            HWND tab = add_ctrl(hwnd, ctx->font, WC_TABCONTROLW, L"", 0, 8, 6, 614, 280, IDC_TAB_MAIN);
             TCITEMW tie{};
             tie.mask = TCIF_TEXT;
             tie.pszText = const_cast<wchar_t*>(L"Capture");
@@ -288,106 +351,110 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return c;
             };
 
+            // --- Capture Tab ---
             cap(L"STATIC", L"Target Process:", 0, 12, 14, 100, 20, 0);
             cap(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 115, 10, 250, 240, IDC_PROC_COMBO);
             cap(L"BUTTON", L"Attach", 0, 372, 10, 68, 24, IDC_BTN_ATTACH);
             cap(L"BUTTON", L"Detach", 0, 446, 10, 68, 24, IDC_BTN_DETACH);
             cap(L"BUTTON", L"Launch EXE...", 0, 520, 10, 96, 24, IDC_BTN_LAUNCH);
 
-            cap(L"STATIC", L"Target Window:", 0, 12, 46, 100, 20, 0);
-            cap(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 115, 42, 501, 200, IDC_SWAP_COMBO);
+            cap(L"STATIC", L"Target Window:", 0, 12, 48, 100, 20, 0);
+            cap(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 115, 44, 501, 200, IDC_SWAP_COMBO);
 
-            cap(L"STATIC", L"Output Folder:", 0, 12, 78, 100, 20, 0);
-            cap(L"EDIT", ctx->app->output_dir.c_str(), WS_BORDER | ES_AUTOHSCROLL, 115, 76, 425, 22, IDC_EDIT_OUTDIR);
-            cap(L"BUTTON", L"Browse...", 0, 546, 75, 70, 24, IDC_BTN_BROWSE);
+            HWND c_lin = cap(L"BUTTON", L"Linearize (Gray8/Phase)", BS_AUTOCHECKBOX, 12, 82, 175, 22, IDC_CHK_LINEAR);
+            HWND c_rev = cap(L"BUTTON", L"Reversed-Z", BS_AUTOCHECKBOX, 200, 82, 110, 22, IDC_CHK_REVZ);
+            SendMessageW(c_lin, BM_SETCHECK, BST_CHECKED, 0);
+            SendMessageW(c_rev, BM_SETCHECK, BST_CHECKED, 0);
 
-            cap(L"STATIC", L"Depth Format:", 0, 12, 112, 100, 20, 0);
-            HWND mode_cb = cap(L"COMBOBOX", L"", CBS_DROPDOWNLIST, 115, 108, 240, 120, IDC_MODE_COMBO);
+            cap(L"STATIC", L"Z-Near:", 0, 12, 116, 52, 20, 0);
+            cap(L"EDIT", L"0.100", WS_BORDER | ES_AUTOHSCROLL, 66, 113, 80, 22, IDC_EDIT_ZNEAR);
+            HWND s_zn = cap(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_NOTICKS, 12, 138, 190, 24, IDC_SLIDER_ZNEAR);
+            SendMessageW(s_zn, TBM_SETRANGE, TRUE, MAKELONG(0, 1000));
+            SendMessageW(s_zn, TBM_SETPOS, TRUE, znear_to_slider(0.1f));
+
+            cap(L"STATIC", L"Z-Far:", 0, 220, 116, 46, 20, 0);
+            cap(L"EDIT", L"500.0", WS_BORDER | ES_AUTOHSCROLL, 268, 113, 86, 22, IDC_EDIT_ZFAR);
+            HWND s_zf = cap(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_NOTICKS, 220, 138, 190, 24, IDC_SLIDER_ZFAR);
+            SendMessageW(s_zf, TBM_SETRANGE, TRUE, MAKELONG(0, 1000));
+            SendMessageW(s_zf, TBM_SETPOS, TRUE, zfar_to_slider(500.0f));
+
+            cap(L"BUTTON", L"Auto Config", 0, 424, 118, 192, 34, IDC_BTN_AUTOCONFIG);
+
+            cap(L"BUTTON", L"Start Recording", BS_DEFPUSHBUTTON, 12, 194, 295, 34, IDC_BTN_RECORD);
+            cap(L"BUTTON", L"Cycle Depth Buffer", 0, 321, 194, 295, 34, IDC_BTN_CYCLE_DEPTH);
+
+            // --- Settings Tab (Persistent via depth_recorder.ini) ---
+            set(L"STATIC", L"Output Folder:", 0, 14, 16, 100, 20, 0);
+            set(L"EDIT", ctx->app->output_dir.c_str(), WS_BORDER | ES_AUTOHSCROLL, 125, 13, 412, 22, IDC_EDIT_OUTDIR);
+            set(L"BUTTON", L"Browse...", 0, 544, 12, 70, 24, IDC_BTN_BROWSE);
+
+            set(L"STATIC", L"Depth Format:", 0, 14, 48, 100, 20, 0);
+            HWND mode_cb = set(L"COMBOBOX", L"", CBS_DROPDOWNLIST, 125, 44, 235, 120, IDC_MODE_COMBO);
             SendMessageW(mode_cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Gray8 (H.264 MP4)"));
             SendMessageW(mode_cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"ColorPhase (H.264 MP4, Lossy-Safe)"));
             SendMessageW(mode_cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"RGB24 Lossless (UtVideo MKV, 16.7M)"));
-            SendMessageW(mode_cb, CB_SETCURSEL, 2, 0);
+            SendMessageW(mode_cb, CB_SETCURSEL, cfg ? cfg->depth_mode : 0, 0);
 
-            cap(L"STATIC", L"Overlay Corner:", 0, 372, 112, 95, 20, 0);
-            HWND corner_cb = cap(L"COMBOBOX", L"", CBS_DROPDOWNLIST, 470, 108, 146, 120, IDC_CORNER_COMBO);
+            set(L"STATIC", L"Recording FPS:", 0, 374, 48, 95, 20, 0);
+            HWND fps_cb = set(L"COMBOBOX", L"", CBS_DROPDOWN | WS_VSCROLL, 474, 44, 140, 140, IDC_RECFPS_COMBO);
+            for (const wchar_t* fopt : {L"24", L"30", L"60", L"120", L"144"}) {
+                SendMessageW(fps_cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(fopt));
+            }
+            SetWindowTextW(fps_cb, std::to_wstring(ctx->app->recording_fps).c_str());
+
+            HWND c_dep = set(L"BUTTON", L"Enable Depth Pass", BS_AUTOCHECKBOX, 14, 80, 140, 22, IDC_CHK_DEPTH);
+            HWND c_ovl = set(L"BUTTON", L"In-Game FPS Overlay", BS_AUTOCHECKBOX, 165, 80, 155, 22, IDC_CHK_OVERLAY);
+            HWND c_prv = set(L"BUTTON", L"Live Depth Preview", BS_AUTOCHECKBOX, 330, 80, 145, 22, IDC_CHK_PREVIEW);
+            SendMessageW(c_dep, BM_SETCHECK, (!cfg || cfg->depth_enabled) ? BST_CHECKED : BST_UNCHECKED, 0);
+            SendMessageW(c_ovl, BM_SETCHECK, (!cfg || cfg->overlay_enabled) ? BST_CHECKED : BST_UNCHECKED, 0);
+            SendMessageW(c_prv, BM_SETCHECK, (!cfg || cfg->preview_enabled) ? BST_CHECKED : BST_UNCHECKED, 0);
+
+            HWND corner_cb = set(L"COMBOBOX", L"", CBS_DROPDOWNLIST, 480, 78, 134, 120, IDC_CORNER_COMBO);
             SendMessageW(corner_cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Top-Left"));
             SendMessageW(corner_cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Top-Right"));
             SendMessageW(corner_cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Bottom-Left"));
             SendMessageW(corner_cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Bottom-Right"));
-            SendMessageW(corner_cb, CB_SETCURSEL, 0, 0);
+            SendMessageW(corner_cb, CB_SETCURSEL, cfg ? cfg->overlay_corner : 0, 0);
 
-            HWND c1 = cap(L"BUTTON", L"Enable Depth Pass", BS_AUTOCHECKBOX, 12, 146, 135, 22, IDC_CHK_DEPTH);
-            HWND c2 = cap(L"BUTTON", L"Linearize (Gray8/Phase)", BS_AUTOCHECKBOX, 155, 146, 165, 22, IDC_CHK_LINEAR);
-            HWND c3 = cap(L"BUTTON", L"Reversed-Z", BS_AUTOCHECKBOX, 330, 146, 100, 22, IDC_CHK_REVZ);
-            HWND c4 = cap(L"BUTTON", L"In-Game FPS Overlay", BS_AUTOCHECKBOX, 445, 146, 165, 22, IDC_CHK_OVERLAY);
-            SendMessageW(c1, BM_SETCHECK, BST_CHECKED, 0);
-            SendMessageW(c2, BM_SETCHECK, BST_CHECKED, 0);
-            SendMessageW(c3, BM_SETCHECK, BST_CHECKED, 0);
-            SendMessageW(c4, BM_SETCHECK, BST_CHECKED, 0);
-
-            cap(L"STATIC", L"Z-Near:", 0, 12, 178, 52, 20, 0);
-            cap(L"EDIT", L"0.100", WS_BORDER | ES_AUTOHSCROLL, 66, 175, 80, 22, IDC_EDIT_ZNEAR);
-            HWND s_zn = cap(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_NOTICKS, 12, 200, 190, 24, IDC_SLIDER_ZNEAR);
-            SendMessageW(s_zn, TBM_SETRANGE, TRUE, MAKELONG(0, 1000));
-            SendMessageW(s_zn, TBM_SETPOS, TRUE, znear_to_slider(0.1f));
-
-            cap(L"STATIC", L"Z-Far:", 0, 220, 178, 46, 20, 0);
-            cap(L"EDIT", L"500.0", WS_BORDER | ES_AUTOHSCROLL, 268, 175, 86, 22, IDC_EDIT_ZFAR);
-            HWND s_zf = cap(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_NOTICKS, 220, 200, 190, 24, IDC_SLIDER_ZFAR);
-            SendMessageW(s_zf, TBM_SETRANGE, TRUE, MAKELONG(0, 1000));
-            SendMessageW(s_zf, TBM_SETPOS, TRUE, zfar_to_slider(500.0f));
-
-            cap(L"BUTTON", L"Auto Config", 0, 424, 180, 192, 34, IDC_BTN_AUTOCONFIG);
-
-            cap(L"BUTTON", L"Start Recording (F9)", BS_DEFPUSHBUTTON, 12, 234, 295, 32, IDC_BTN_RECORD);
-            cap(L"BUTTON", L"Cycle Depth Buffer (F10)", 0, 321, 234, 295, 32, IDC_BTN_CYCLE_DEPTH);
-            add_ctrl(hwnd, ctx->font, L"STATIC", L"State: Idle", SS_SUNKEN, 12, 320, 604, 24, IDC_LBL_STATUS);
-
-            // Settings tab controls
-            set(L"STATIC", L"Record Toggle Keybind:", 0, 20, 24, 160, 20, 0);
-            HWND hk_rec = set(HOTKEY_CLASSW, L"", WS_BORDER, 190, 20, 200, 24, IDC_HK_RECORD);
-            SendMessageW(hk_rec, HKM_SETHOTKEY, MAKEWORD(ctx->app->hotkey_record_vk, 0), 0);
-
-            set(L"STATIC", L"Cycle Depth Keybind:", 0, 20, 60, 160, 20, 0);
-            HWND hk_cyc = set(HOTKEY_CLASSW, L"", WS_BORDER, 190, 60, 200, 24, IDC_HK_CYCLE);
-            SendMessageW(hk_cyc, HKM_SETHOTKEY, MAKEWORD(ctx->app->hotkey_cycle_vk, 0), 0);
-
-            HWND c_prev = set(L"BUTTON", L"Live Depth Preview", BS_AUTOCHECKBOX, 190, 96, 160, 22, IDC_CHK_PREVIEW);
-            SendMessageW(c_prev, BM_SETCHECK, BST_CHECKED, 0);
-
-            set(L"STATIC", L"H.264 Quality:", 0, 20, 130, 160, 20, 0);
-            HWND s_qual = set(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_NOTICKS, 190, 126, 200, 24, IDC_SLIDER_QUAL);
+            set(L"STATIC", L"H.264 Quality:", 0, 14, 114, 100, 20, 0);
+            HWND s_qual = set(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_NOTICKS, 125, 110, 200, 24, IDC_SLIDER_QUAL);
             SendMessageW(s_qual, TBM_SETRANGE, TRUE, MAKELONG(1, 100));
             SendMessageW(s_qual, TBM_SETPOS, TRUE, static_cast<LPARAM>(ctx->app->h264_quality));
-            set(L"STATIC", L"85%", 0, 398, 130, 50, 20, IDC_LBL_QUAL);
+            wchar_t qbuf[16]{};
+            swprintf_s(qbuf, L"%u%%", ctx->app->h264_quality);
+            set(L"STATIC", qbuf, 0, 330, 114, 50, 20, IDC_LBL_QUAL);
 
-            set(L"STATIC", L"Extra FFmpeg Flags:", 0, 20, 164, 160, 20, 0);
-            set(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, 190, 161, 300, 22, IDC_EDIT_FFMPEG);
+            set(L"STATIC", L"Extra FFmpeg Flags:", 0, 14, 148, 110, 20, 0);
+            set(L"EDIT", ctx->app->extra_ffmpeg_flags.c_str(), WS_BORDER | ES_AUTOHSCROLL, 125, 145, 489, 22, IDC_EDIT_FFMPEG);
 
-            set(L"BUTTON", L"Apply Keybinds / Settings", 0, 190, 196, 200, 28, IDC_BTN_APPLY_HK);
+            set(L"STATIC", L"Record Keybind:", 0, 14, 184, 105, 20, 0);
+            HWND hk_rec = set(HOTKEY_CLASSW, L"", WS_BORDER, 125, 180, 180, 24, IDC_HK_RECORD);
+            SendMessageW(hk_rec, HKM_SETHOTKEY,
+                         MAKEWORD(ctx->app->hotkey_record_vk, win32_mods_to_hk(ctx->app->hotkey_record_mod)), 0);
 
+            set(L"BUTTON", L"Apply & Save Settings", 0, 320, 178, 294, 28, IDC_BTN_APPLY_HK);
+
+            // Shared Status Bar & Live Depth Preview
+            add_ctrl(hwnd, ctx->font, L"STATIC", L"State: Idle", SS_SUNKEN, 12, 294, 604, 24, IDC_LBL_STATUS);
             add_ctrl(hwnd, ctx->font, L"STATIC", L"Depth Preview:", 0, 632, 8, 240, 18, 0);
             add_ctrl(hwnd, ctx->font, L"STATIC", L"", SS_OWNERDRAW | WS_BORDER, 632, 30, 240, 240, IDC_PREVIEW_BOX);
-            switch_tab(ctx, 0);
 
+            switch_tab(ctx, 0);
             populate_processes(ctx);
-            RegisterHotKey(hwnd, kHotkeyRecordId, 0, ctx->app->hotkey_record_vk);
-            RegisterHotKey(hwnd, kHotkeyCycleId, 0, ctx->app->hotkey_cycle_vk);
+            RegisterHotKey(hwnd, kHotkeyRecordId, ctx->app->hotkey_record_mod, ctx->app->hotkey_record_vk);
             SetTimer(hwnd, kTimerId, 200, nullptr);
             return 0;
         }
         case WM_HSCROLL: {
             HWND src = reinterpret_cast<HWND>(lp);
             if (src == GetDlgItem(hwnd, IDC_SLIDER_ZNEAR)) {
-                const int pos = static_cast<int>(SendMessageW(src, TBM_GETPOS, 0, 0));
-                const float zn = slider_to_znear(pos);
+                const float zn = slider_to_znear(static_cast<int>(SendMessageW(src, TBM_GETPOS, 0, 0)));
                 wchar_t buf[32]{};
                 swprintf_s(buf, L"%.3f", zn);
                 SetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_ZNEAR), buf);
                 sync_ui_to_config(ctx);
             } else if (src == GetDlgItem(hwnd, IDC_SLIDER_ZFAR)) {
-                const int pos = static_cast<int>(SendMessageW(src, TBM_GETPOS, 0, 0));
-                const float zf = slider_to_zfar(pos);
+                const float zf = slider_to_zfar(static_cast<int>(SendMessageW(src, TBM_GETPOS, 0, 0)));
                 wchar_t buf[32]{};
                 swprintf_s(buf, L"%.1f", zf);
                 SetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_ZFAR), buf);
@@ -424,6 +491,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             } else if (id == IDC_BTN_DETACH) {
                 if (auto* cfg = ctx->app->config_view.get()) {
                     InterlockedExchange(&cfg->recording, 0);
+                    InterlockedExchange(&cfg->actual_rec_fps_x10, 0);
                     InterlockedIncrement(&cfg->unload_seq);
                     InterlockedExchange(&cfg->hooked_pid, 0);
                     InterlockedExchange(&cfg->active_backend, 0);
@@ -432,7 +500,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     InterlockedExchange(&cfg->selected_swapchain_index, 0);
                     ctx->last_auto_backend = 0;
                     ctx->last_swapchain_count = -1;
-                    SetWindowTextW(GetDlgItem(hwnd, IDC_BTN_RECORD), L"Start Recording (F9)");
+                    SetWindowTextW(GetDlgItem(hwnd, IDC_BTN_RECORD), L"Start Recording");
                     std::lock_guard lock(ctx->app->preview_mutex);
                     ctx->app->preview_bgra.clear();
                 }
@@ -468,6 +536,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (SHGetPathFromIDListW(pidl, path)) {
                         SetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_OUTDIR), path);
                         sync_ui_to_config(ctx);
+                        save_settings_ini(*ctx->app, ctx->app->config_view.get());
                     }
                     CoTaskMemFree(pidl);
                 }
@@ -478,19 +547,13 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             } else if (id == IDC_BTN_APPLY_HK) {
                 sync_ui_to_config(ctx);
                 const LRESULT r_hk = SendMessageW(GetDlgItem(hwnd, IDC_HK_RECORD), HKM_GETHOTKEY, 0, 0);
-                const LRESULT c_hk = SendMessageW(GetDlgItem(hwnd, IDC_HK_CYCLE), HKM_GETHOTKEY, 0, 0);
                 if (LOWORD(r_hk) != 0) {
                     UnregisterHotKey(hwnd, kHotkeyRecordId);
                     ctx->app->hotkey_record_vk = LOBYTE(LOWORD(r_hk));
-                    ctx->rec_mod = hk_mods_to_win32(HIBYTE(LOWORD(r_hk)));
-                    RegisterHotKey(hwnd, kHotkeyRecordId, ctx->rec_mod, ctx->app->hotkey_record_vk);
+                    ctx->app->hotkey_record_mod = hk_mods_to_win32(HIBYTE(LOWORD(r_hk)));
+                    RegisterHotKey(hwnd, kHotkeyRecordId, ctx->app->hotkey_record_mod, ctx->app->hotkey_record_vk);
                 }
-                if (LOWORD(c_hk) != 0) {
-                    UnregisterHotKey(hwnd, kHotkeyCycleId);
-                    ctx->app->hotkey_cycle_vk = LOBYTE(LOWORD(c_hk));
-                    ctx->cyc_mod = hk_mods_to_win32(HIBYTE(LOWORD(c_hk)));
-                    RegisterHotKey(hwnd, kHotkeyCycleId, ctx->cyc_mod, ctx->app->hotkey_cycle_vk);
-                }
+                save_settings_ini(*ctx->app, ctx->app->config_view.get());
             } else if (id == IDC_BTN_AUTOCONFIG) {
                 run_auto_config(ctx, false);
             } else if ((id == IDC_EDIT_ZNEAR || id == IDC_EDIT_ZFAR) && code == EN_KILLFOCUS) {
@@ -498,18 +561,26 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (auto* cfg = ctx->app->config_view.get()) {
                     set_z_controls(hwnd, cfg->z_near, cfg->z_far);
                 }
-            } else if (id == IDC_MODE_COMBO || id == IDC_CORNER_COMBO ||
+            } else if (id == IDC_RECFPS_COMBO && code == CBN_SELCHANGE) {
+                const LRESULT sel = SendMessageW(GetDlgItem(hwnd, IDC_RECFPS_COMBO), CB_GETCURSEL, 0, 0);
+                if (sel >= 0) {
+                    wchar_t fbuf[16]{};
+                    SendMessageW(GetDlgItem(hwnd, IDC_RECFPS_COMBO), CB_GETLBTEXT, sel, reinterpret_cast<LPARAM>(fbuf));
+                    SetWindowTextW(GetDlgItem(hwnd, IDC_RECFPS_COMBO), fbuf);
+                }
+                sync_ui_to_config(ctx);
+                save_settings_ini(*ctx->app, ctx->app->config_view.get());
+            } else if ((id == IDC_RECFPS_COMBO && code == CBN_KILLFOCUS) ||
+                       id == IDC_MODE_COMBO || id == IDC_CORNER_COMBO ||
                        id == IDC_CHK_DEPTH || id == IDC_CHK_LINEAR ||
                        id == IDC_CHK_REVZ || id == IDC_CHK_OVERLAY || id == IDC_CHK_PREVIEW) {
                 sync_ui_to_config(ctx);
+                save_settings_ini(*ctx->app, ctx->app->config_view.get());
             }
             return 0;
         }
         case WM_HOTKEY: {
             if (wp == kHotkeyRecordId) toggle_recording(ctx);
-            else if (wp == kHotkeyCycleId) {
-                if (auto* cfg = ctx->app->config_view.get()) InterlockedIncrement(&cfg->cycle_depth_seq);
-            }
             return 0;
         }
         case WM_DRAWITEM: {
@@ -565,9 +636,10 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_DESTROY: {
+            sync_ui_to_config(ctx);
+            save_settings_ini(*ctx->app, ctx->app->config_view.get());
             KillTimer(hwnd, kTimerId);
             UnregisterHotKey(hwnd, kHotkeyRecordId);
-            UnregisterHotKey(hwnd, kHotkeyCycleId);
             if (ctx->font) DeleteObject(ctx->font);
             ctx->app->running.store(false);
             PostQuitMessage(0);
@@ -595,7 +667,7 @@ int run_win32_ui(HINSTANCE hInstance, RecorderAppState& app) {
     HWND hwnd = CreateWindowExW(
         0, wc.lpszClassName, L"Depth Recorder (Portable)",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 895, 388,
+        CW_USEDEFAULT, CW_USEDEFAULT, 895, 360,
         nullptr, nullptr, hInstance, &ctx);
     if (!hwnd) return 1;
 
@@ -611,4 +683,3 @@ int run_win32_ui(HINSTANCE hInstance, RecorderAppState& app) {
 }
 
 } // namespace dr
-

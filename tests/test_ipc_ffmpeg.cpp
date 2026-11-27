@@ -1,6 +1,7 @@
 #include "common/depth_math.h"
 #include "common/ipc_ring.h"
 #include "recorder/encoder.h"
+#include "recorder/pacer.h"
 
 #include <cassert>
 #include <cmath>
@@ -108,8 +109,29 @@ int main() {
         assert(decoded[i * 3 + 2] == depth_rgb0[i * 4 + 2]);
     }
 
+    // 4. QpcFramePacer real-time pacing check (10 frames over 1.0s at 30fps -> ~30 output writes, 120fps -> skips)
+    {
+        dr::QpcFramePacer pacer;
+        pacer.reset(30);
+        const int64_t freq = 10000000; // 10 MHz
+        uint32_t total_writes = 0;
+        for (int i = 0; i < 10; ++i) {
+            // 100ms apart (simulating 10 FPS game / dropped frames while recording at 30 FPS)
+            total_writes += pacer.compute_writes_for_frame(static_cast<int64_t>(i) * 1000000, freq);
+        }
+        assert(total_writes == 28); // 0s..0.9s at 30fps = 28 frames (exact 1x real-time)
+
+        pacer.reset(30);
+        uint32_t capped_writes = 0;
+        for (int i = 0; i < 120; ++i) {
+            // 120 FPS game while recording at 30 FPS -> must skip excess frames
+            capped_writes += pacer.compute_writes_for_frame(static_cast<int64_t>(i) * (freq / 120), freq);
+        }
+        assert(capped_writes == 30);
+    }
+
     std::filesystem::remove_all(out_dir);
-    std::printf("test_ipc_ffmpeg PASSED (bit-exact UtVideo 24-bit depth verified)\n");
+    std::printf("test_ipc_ffmpeg PASSED (bit-exact UtVideo 24-bit depth + QPC real-time pacing verified)\n");
     return 0;
 }
 

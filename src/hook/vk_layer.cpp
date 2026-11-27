@@ -228,11 +228,13 @@ struct DeviceData {
     void* depth_mapped[kStagingSlots]{};
 
     bool slot_pending[kStagingSlots]{};
+    bool slot_has_color[kStagingSlots]{};
     int64_t slot_qpc[kStagingSlots]{};
     uint32_t slot_mode[kStagingSlots]{};
     bool slot_has_depth[kStagingSlots]{};
     uint32_t slot_depth_bpp[kStagingSlots]{};
     bool slot_is_rgba[kStagingSlots]{};
+    int64_t last_preview_qpc = 0;
 
     // FPS overlay resources
     VkImage overlay_img = VK_NULL_HANDLE;
@@ -948,47 +950,49 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_vkQueuePresentKHR(VkQueue queue, const VkPre
                 const double fps = dr::tick_fps_and_telemetry(cfg, 3, dev->last_qpc, dev->qpc_freq,
                                                               dev->last_cycle_seq, dev->selected_depth_idx, now_qpc);
 
-                const bool recording = (cfg && (cfg->recording != 0 || cfg->preview_enabled != 0) && g_ipc_ring.event_handle());
+                const bool is_recording = (cfg && cfg->recording != 0 && g_ipc_ring.event_handle() != nullptr);
+                const bool is_preview = (!is_recording && cfg && cfg->preview_enabled != 0 && g_ipc_ring.event_handle() != nullptr &&
+                                         dr::should_capture_preview_now(now_qpc, dev->qpc_freq, dev->last_preview_qpc));
+                const bool capture_now = is_recording || is_preview;
                 const bool overlay = (cfg && cfg->overlay_enabled != 0);
 
-                // 1. Drain completed readback slot
-                const uint32_t read_slot = static_cast<uint32_t>((dev->frame_idx + 1) % kStagingSlots);
-                if (recording && dev->slot_pending[read_slot]) {
-                    dev->WaitForFences(dev->device, 1, &dev->fences[read_slot], VK_TRUE, UINT64_MAX);
+                // 1. Drain completed readback slot(s)
+                const uint32_t write_slot = static_cast<uint32_t>(dev->frame_idx % kStagingSlots);
+                if (is_recording || (cfg && cfg->preview_enabled != 0 && g_ipc_ring.event_handle())) {
+                    for (uint32_t off = 1; off <= kStagingSlots; ++off) {
+                        const uint32_t read_slot = (write_slot + off) % kStagingSlots;
+                        if (!dev->slot_pending[read_slot]) continue;
+                        dev->WaitForFences(dev->device, 1, &dev->fences[read_slot], VK_TRUE, UINT64_MAX);
 
-                    const size_t color_bytes = static_cast<size_t>(w) * h * 4;
-                    dev->color_pack_buf.resize(color_bytes);
-                    if (dev->slot_is_rgba[read_slot]) {
-                        const auto* src = static_cast<const uint8_t*>(dev->color_mapped[read_slot]);
-                        for (size_t i = 0; i < color_bytes; i += 4) {
-                            dev->color_pack_buf[i + 0] = src[i + 2];
-                            dev->color_pack_buf[i + 1] = src[i + 1];
-                            dev->color_pack_buf[i + 2] = src[i + 0];
-                            dev->color_pack_buf[i + 3] = src[i + 3];
+                        uint32_t color_bytes = 0;
+                        bool is_rgba = false;
+                        if (dev->slot_has_color[read_slot]) {
+                            color_bytes = w * h * 4;
+                            dev->color_pack_buf.resize(color_bytes);
+                            std::memcpy(dev->color_pack_buf.data(), dev->color_mapped[read_slot], color_bytes);
+                            is_rgba = dev->slot_is_rgba[read_slot];
                         }
-                    } else {
-                        std::memcpy(dev->color_pack_buf.data(), dev->color_mapped[read_slot], color_bytes);
-                    }
 
-                    uint32_t depth_bytes = 0;
-                    if (dev->slot_has_depth[read_slot]) {
-                        depth_bytes = w * h * dev->slot_depth_bpp[read_slot];
-                        dev->depth_pack_buf.resize(depth_bytes);
-                        std::memcpy(dev->depth_pack_buf.data(), dev->depth_mapped[read_slot], depth_bytes);
-                    }
+                        uint32_t depth_bytes = 0;
+                        if (dev->slot_has_depth[read_slot]) {
+                            depth_bytes = w * h * dev->slot_depth_bpp[read_slot];
+                            dev->depth_pack_buf.resize(depth_bytes);
+                            std::memcpy(dev->depth_pack_buf.data(), dev->depth_mapped[read_slot], depth_bytes);
+                        }
 
-                    dr::push_frame_to_ring(g_ipc_ring, cfg, dev->frame_idx, dev->slot_qpc[read_slot], dev->qpc_freq,
-                                           w, h, dev->slot_mode[read_slot], dev->slot_has_depth[read_slot],
-                                           dev->color_pack_buf.data(), static_cast<uint32_t>(color_bytes),
-                                           dev->depth_pack_buf.data(), depth_bytes);
-                    dev->slot_pending[read_slot] = false;
-                } else if (!recording) {
+                        dr::push_frame_to_ring(g_ipc_ring, cfg, dev->frame_idx, dev->slot_qpc[read_slot], dev->qpc_freq,
+                                               w, h, dev->slot_mode[read_slot], dev->slot_has_depth[read_slot],
+                                               color_bytes ? dev->color_pack_buf.data() : nullptr, color_bytes,
+                                               depth_bytes ? dev->depth_pack_buf.data() : nullptr, depth_bytes,
+                                               is_rgba, !dev->slot_has_color[read_slot]);
+                        dev->slot_pending[read_slot] = false;
+                    }
+                } else {
                     for (bool& p : dev->slot_pending) p = false;
                 }
 
                 // 2. Record current frame capture + overlay command buffer
-                const uint32_t write_slot = static_cast<uint32_t>(dev->frame_idx % kStagingSlots);
-                if (recording || overlay) {
+                if (capture_now || overlay) {
                     if (dev->slot_pending[write_slot]) {
                         dev->WaitForFences(dev->device, 1, &dev->fences[write_slot], VK_TRUE, UINT64_MAX);
                         dev->slot_pending[write_slot] = false;
@@ -1003,17 +1007,19 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_vkQueuePresentKHR(VkQueue queue, const VkPre
 
                     VkImageLayout swap_layout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
-                    if (recording) {
-                        cmd_barrier(dev, cmd, swap_img, VK_IMAGE_ASPECT_COLOR_BIT,
-                                    swap_layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                    VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-                                    VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-                        swap_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                    if (capture_now) {
+                        if (is_recording) {
+                            cmd_barrier(dev, cmd, swap_img, VK_IMAGE_ASPECT_COLOR_BIT,
+                                        swap_layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                        VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                                        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                            swap_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
 
-                        VkBufferImageCopy bic{};
-                        bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-                        bic.imageExtent = {w, h, 1};
-                        dev->CmdCopyImageToBuffer(cmd, swap_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dev->color_buf[write_slot], 1, &bic);
+                            VkBufferImageCopy bic{};
+                            bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                            bic.imageExtent = {w, h, 1};
+                            dev->CmdCopyImageToBuffer(cmd, swap_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dev->color_buf[write_slot], 1, &bic);
+                        }
 
                         const bool want_depth = (cfg->depth_enabled != 0);
                         const uint32_t mode = static_cast<uint32_t>(cfg->depth_mode);
@@ -1072,7 +1078,10 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_vkQueuePresentKHR(VkQueue queue, const VkPre
                                                 VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
                                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT);
 
-                                    dev->CmdCopyImageToBuffer(cmd, out_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dev->depth_buf[write_slot], 1, &bic);
+                                    VkBufferImageCopy dbic{};
+                                    dbic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                                    dbic.imageExtent = {w, h, 1};
+                                    dev->CmdCopyImageToBuffer(cmd, out_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dev->depth_buf[write_slot], 1, &dbic);
                                     captured_depth = true;
                                 }
                             }
@@ -1083,13 +1092,15 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_vkQueuePresentKHR(VkQueue queue, const VkPre
                         dev->slot_has_depth[write_slot] = captured_depth;
                         dev->slot_depth_bpp[write_slot] = (mode == static_cast<uint32_t>(dr::DepthMode::Gray8)) ? 1u : 4u;
                         dev->slot_is_rgba[write_slot] = is_rgba_swapchain_format(sci.format);
+                        dev->slot_has_color[write_slot] = is_recording;
                         dev->slot_pending[write_slot] = true;
                     }
 
                     if (overlay) {
                         std::vector<uint8_t> rgba;
                         uint32_t bw = 0, bh = 0;
-                        dr::render_fps_overlay_rgba(fps, cfg->recording != 0, rgba, bw, bh);
+                        const double rec_fps = cfg ? (static_cast<double>(cfg->actual_rec_fps_x10) / 10.0) : 0.0;
+                        dr::render_fps_overlay_rgba(fps, rec_fps, cfg->recording != 0, rgba, bw, bh);
 
                         if (bw <= w && bh <= h && ensure_overlay_image(dev, bw, bh)) {
                             std::memcpy(dev->overlay_buf_mapped, rgba.data(), rgba.size());
@@ -1152,8 +1163,8 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_vkQueuePresentKHR(VkQueue queue, const VkPre
                     si.pSignalSemaphores = &dev->overlay_sem;
 
                     if (dev->QueueSubmit(queue, 1, &si, dev->fences[write_slot]) == VK_SUCCESS) {
-                        if (!recording) {
-                            // If not recording, wait on overlay fence next time this slot is used
+                        if (!capture_now) {
+                            // If not capturing, wait on overlay fence next time this slot is used
                             dev->WaitForFences(dev->device, 1, &dev->fences[write_slot], VK_TRUE, UINT64_MAX);
                         }
                         modified_present.waitSemaphoreCount = 1;

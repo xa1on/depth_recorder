@@ -85,13 +85,17 @@ struct Dx11State {
     bool clear_snap_valid_this_frame = false;
 
     // 3-slot staging ring
+    DXGI_FORMAT bb_format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    ComPtr<ID3D11Texture2D> color_resolve_tex;
     ComPtr<ID3D11Texture2D> color_staging[kStagingSlots];
     ComPtr<ID3D11Texture2D> depth_staging[kStagingSlots];
     uint32_t depth_staging_bpp[kStagingSlots]{};
     bool slot_pending[kStagingSlots]{};
+    bool slot_has_color[kStagingSlots]{};
     int64_t slot_qpc[kStagingSlots]{};
     uint32_t slot_mode[kStagingSlots]{};
     bool slot_has_depth[kStagingSlots]{};
+    int64_t last_preview_qpc = 0;
 
     // FPS overlay resources
     ComPtr<ID3D11VertexShader> vs_overlay;
@@ -157,6 +161,7 @@ void release_size_dependent() {
         g_dx11.depth_staging[i].Reset();
         g_dx11.slot_pending[i] = false;
     }
+    g_dx11.color_resolve_tex.Reset();
     g_dx11.out_gray_tex.Reset();
     g_dx11.out_gray_uav.Reset();
     g_dx11.out_rgba_tex.Reset();
@@ -222,11 +227,15 @@ bool ensure_pipeline(IDXGISwapChain* swap) {
     const uint32_t w = scd.BufferDesc.Width;
     const uint32_t h = scd.BufferDesc.Height;
     if (w == 0 || h == 0) return false;
+    DXGI_FORMAT bb_fmt = scd.BufferDesc.Format;
+    if (bb_fmt == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) bb_fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+    else if (bb_fmt == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) bb_fmt = DXGI_FORMAT_B8G8R8A8_UNORM;
 
-    if (g_dx11.width != w || g_dx11.height != h) {
+    if (g_dx11.width != w || g_dx11.height != h || g_dx11.bb_format != bb_fmt) {
         release_size_dependent();
         g_dx11.width = w;
         g_dx11.height = h;
+        g_dx11.bb_format = bb_fmt;
 
         D3D11_TEXTURE2D_DESC td{};
         td.Width = w;
@@ -252,7 +261,7 @@ bool ensure_pipeline(IDXGISwapChain* swap) {
         td.Usage = D3D11_USAGE_STAGING;
         td.BindFlags = 0;
         td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.Format = bb_fmt;
         for (uint32_t i = 0; i < kStagingSlots; ++i) {
             g_dx11.device->CreateTexture2D(&td, nullptr, g_dx11.color_staging[i].GetAddressOf());
         }
@@ -293,7 +302,7 @@ void ensure_depth_staging(uint32_t slot, uint32_t bpp) {
     g_dx11.depth_staging_bpp[slot] = bpp;
 }
 
-void draw_fps_overlay(IDXGISwapChain* swap, double fps, bool recording, OverlayCorner corner) {
+void draw_fps_overlay(IDXGISwapChain* swap, double fps, double rec_fps, bool recording, OverlayCorner corner) {
     ComPtr<ID3D11Texture2D> backbuf;
     if (FAILED(swap->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(backbuf.GetAddressOf())))) return;
     ComPtr<ID3D11RenderTargetView> rtv;
@@ -301,7 +310,7 @@ void draw_fps_overlay(IDXGISwapChain* swap, double fps, bool recording, OverlayC
 
     std::vector<uint8_t> rgba;
     uint32_t bw = 0, bh = 0;
-    render_fps_overlay_rgba(fps, recording, rgba, bw, bh);
+    render_fps_overlay_rgba(fps, rec_fps, recording, rgba, bw, bh);
 
     if (!g_dx11.font_tex || g_dx11.font_w != bw || g_dx11.font_h != bh) {
         g_dx11.font_tex.Reset();
@@ -367,10 +376,26 @@ void draw_fps_overlay(IDXGISwapChain* swap, double fps, bool recording, OverlayC
     oOMSetRenderTargets(g_dx11.ctx.Get(), 1, prev_rtvs, prev_dsv.Get());
 }
 
-void capture_frame(IDXGISwapChain* swap, SharedConfig* cfg, int64_t now_qpc) {
-    const uint32_t read_slot = static_cast<uint32_t>((g_dx11.frame_idx + 1) % kStagingSlots);
-    if (g_dx11.slot_pending[read_slot] && g_dx11.color_staging[read_slot]) {
-        copy_staging_tight(g_dx11.color_staging[read_slot].Get(), g_dx11.width, g_dx11.height, 4, g_dx11.color_pack_buf);
+void capture_frame(IDXGISwapChain* swap, SharedConfig* cfg, int64_t now_qpc, bool capture_color) {
+    const uint32_t write_slot = static_cast<uint32_t>(g_dx11.frame_idx % kStagingSlots);
+    for (uint32_t off = 1; off <= kStagingSlots; ++off) {
+        const uint32_t read_slot = (write_slot + off) % kStagingSlots;
+        if (!g_dx11.slot_pending[read_slot]) continue;
+
+        uint32_t color_bytes = 0;
+        bool is_rgba = false;
+        if (g_dx11.slot_has_color[read_slot] && g_dx11.color_staging[read_slot]) {
+            copy_staging_tight(g_dx11.color_staging[read_slot].Get(), g_dx11.width, g_dx11.height, 4, g_dx11.color_pack_buf);
+            if (g_dx11.bb_format == DXGI_FORMAT_R8G8B8A8_UNORM) {
+                is_rgba = true;
+            } else if (g_dx11.bb_format == DXGI_FORMAT_R10G10B10A2_UNORM) {
+                const size_t px_cnt = static_cast<size_t>(g_dx11.width) * g_dx11.height;
+                std::vector<uint8_t> tmp(px_cnt * 4);
+                unpack_r10g10b10a2_to_bgra(g_dx11.color_pack_buf.data(), tmp.data(), px_cnt, false);
+                g_dx11.color_pack_buf.swap(tmp);
+            }
+            color_bytes = static_cast<uint32_t>(g_dx11.color_pack_buf.size());
+        }
         uint32_t depth_bytes = 0;
         if (g_dx11.slot_has_depth[read_slot] && g_dx11.depth_staging[read_slot]) {
             const uint32_t bpp = g_dx11.depth_staging_bpp[read_slot];
@@ -379,15 +404,35 @@ void capture_frame(IDXGISwapChain* swap, SharedConfig* cfg, int64_t now_qpc) {
         }
         push_frame_to_ring(g_ipc_ring, cfg, g_dx11.frame_idx, g_dx11.slot_qpc[read_slot], g_dx11.qpc_freq,
                            g_dx11.width, g_dx11.height, g_dx11.slot_mode[read_slot], g_dx11.slot_has_depth[read_slot],
-                           g_dx11.color_pack_buf.data(), static_cast<uint32_t>(g_dx11.color_pack_buf.size()),
-                           g_dx11.depth_pack_buf.data(), depth_bytes);
+                           color_bytes ? g_dx11.color_pack_buf.data() : nullptr, color_bytes,
+                           depth_bytes ? g_dx11.depth_pack_buf.data() : nullptr, depth_bytes,
+                           is_rgba, !g_dx11.slot_has_color[read_slot]);
         g_dx11.slot_pending[read_slot] = false;
     }
 
-    const uint32_t write_slot = static_cast<uint32_t>(g_dx11.frame_idx % kStagingSlots);
-    ComPtr<ID3D11Texture2D> backbuf;
-    if (SUCCEEDED(swap->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(backbuf.GetAddressOf())))) {
-        g_dx11.ctx->CopyResource(g_dx11.color_staging[write_slot].Get(), backbuf.Get());
+    if (capture_color) {
+        ComPtr<ID3D11Texture2D> backbuf;
+        if (SUCCEEDED(swap->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(backbuf.GetAddressOf())))) {
+            D3D11_TEXTURE2D_DESC bbd{};
+            backbuf->GetDesc(&bbd);
+            if (bbd.SampleDesc.Count > 1) {
+                if (!g_dx11.color_resolve_tex) {
+                    D3D11_TEXTURE2D_DESC rtd = bbd;
+                    rtd.SampleDesc.Count = 1;
+                    rtd.SampleDesc.Quality = 0;
+                    rtd.Format = g_dx11.bb_format;
+                    rtd.BindFlags = 0;
+                    rtd.Usage = D3D11_USAGE_DEFAULT;
+                    g_dx11.device->CreateTexture2D(&rtd, nullptr, g_dx11.color_resolve_tex.GetAddressOf());
+                }
+                if (g_dx11.color_resolve_tex) {
+                    g_dx11.ctx->ResolveSubresource(g_dx11.color_resolve_tex.Get(), 0, backbuf.Get(), 0, g_dx11.bb_format);
+                    g_dx11.ctx->CopyResource(g_dx11.color_staging[write_slot].Get(), g_dx11.color_resolve_tex.Get());
+                }
+            } else {
+                g_dx11.ctx->CopyResource(g_dx11.color_staging[write_slot].Get(), backbuf.Get());
+            }
+        }
     }
 
     const bool want_depth = (cfg && cfg->depth_enabled != 0);
@@ -474,6 +519,7 @@ void capture_frame(IDXGISwapChain* swap, SharedConfig* cfg, int64_t now_qpc) {
     g_dx11.slot_qpc[write_slot] = now_qpc;
     g_dx11.slot_mode[write_slot] = mode;
     g_dx11.slot_has_depth[write_slot] = captured_depth;
+    g_dx11.slot_has_color[write_slot] = capture_color;
     g_dx11.slot_pending[write_slot] = true;
 }
 
@@ -500,14 +546,18 @@ HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swap, UINT sync, UINT flags)
             const double fps = tick_fps_and_telemetry(cfg, 1, g_dx11.last_qpc, g_dx11.qpc_freq,
                                                       g_dx11.last_cycle_seq, g_dx11.selected_depth_idx, now_qpc);
 
-            if (cfg && (cfg->recording != 0 || cfg->preview_enabled != 0) && g_ipc_ring.event_handle()) {
-                capture_frame(swap, cfg, now_qpc);
-            } else {
+            const bool is_recording = (cfg && cfg->recording != 0 && g_ipc_ring.event_handle() != nullptr);
+            const bool is_preview = (!is_recording && cfg && cfg->preview_enabled != 0 && g_ipc_ring.event_handle() != nullptr &&
+                                     should_capture_preview_now(now_qpc, g_dx11.qpc_freq, g_dx11.last_preview_qpc));
+            if (is_recording || is_preview) {
+                capture_frame(swap, cfg, now_qpc, is_recording);
+            } else if (!cfg || (cfg->recording == 0 && cfg->preview_enabled == 0)) {
                 for (bool& p : g_dx11.slot_pending) p = false;
             }
 
             if (cfg && cfg->overlay_enabled != 0) {
-                draw_fps_overlay(swap, fps, cfg->recording != 0,
+                const double rec_fps = static_cast<double>(cfg->actual_rec_fps_x10) / 10.0;
+                draw_fps_overlay(swap, fps, rec_fps, cfg->recording != 0,
                                  static_cast<OverlayCorner>(cfg->overlay_corner));
             }
 

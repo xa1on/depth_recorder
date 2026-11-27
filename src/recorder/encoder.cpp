@@ -22,10 +22,10 @@ std::wstring VideoEncoder::find_ffmpeg() {
 std::string VideoEncoder::probe_h264_encoder(const std::wstring& ffmpeg_path) {
     if (ffmpeg_path.empty()) return "libopenh264";
 
-    for (const char* cand : {"h264_nvenc", "h264_amf", "h264_qsv", "libx264", "libopenh264"}) {
+    for (const char* cand : {"h264_nvenc", "h264_amf", "h264_qsv", "h264_mf", "libx264", "libopenh264"}) {
         std::wstring cand_w(cand, cand + std::strlen(cand));
         std::wstring cmd = L"\"" + ffmpeg_path +
-            L"\" -hide_banner -loglevel error -f lavfi -i color=c=black:s=64x64:d=0.1 -c:v " +
+            L"\" -hide_banner -loglevel error -f lavfi -i color=c=black:s=256x256:d=0.1 -c:v " +
             cand_w + L" -f null -";
         STARTUPINFOW si{sizeof(si)};
         si.dwFlags = STARTF_USESHOWWINDOW;
@@ -115,16 +115,18 @@ bool VideoEncoder::start(uint32_t width, uint32_t height, const EncoderSettings&
 
     const uint32_t q = std::clamp<uint32_t>(settings.h264_quality, 1, 100);
     const uint32_t qp = 42 - (q * 32) / 100; // 100% -> 10, 85% -> 15, 50% -> 26
-    const uint32_t mbps = std::max<uint32_t>(2, (q * q) / 200); // 85% -> 36M, 100% -> 50M
+    const uint32_t mbps = std::max<uint32_t>(2, (q * 16) / 100); // 85% -> 13M, 100% -> 16M
     std::wstring h264_opts;
     if (h264_codec == "h264_nvenc") {
-        h264_opts = L"-rc vbr -cq " + std::to_wstring(qp) + L" -b:v 0";
+        h264_opts = L"-preset p1 -tune ull -rc vbr -cq " + std::to_wstring(qp) + L" -b:v 0";
     } else if (h264_codec == "h264_amf") {
-        h264_opts = L"-rc cqp -qp_i " + std::to_wstring(qp) + L" -qp_p " + std::to_wstring(qp);
+        h264_opts = L"-quality speed -rc cqp -qp_i " + std::to_wstring(qp) + L" -qp_p " + std::to_wstring(qp);
     } else if (h264_codec == "h264_qsv") {
-        h264_opts = L"-global_quality " + std::to_wstring(qp);
+        h264_opts = L"-preset veryfast -global_quality " + std::to_wstring(qp);
+    } else if (h264_codec == "h264_mf") {
+        h264_opts = L"-b:v " + std::to_wstring(mbps) + L"M";
     } else if (h264_codec == "libx264") {
-        h264_opts = L"-crf " + std::to_wstring(qp);
+        h264_opts = L"-preset ultrafast -crf " + std::to_wstring(qp);
     } else {
         h264_opts = L"-b:v " + std::to_wstring(mbps) + L"M -maxrate " + std::to_wstring(mbps * 2) + L"M";
     }
@@ -133,9 +135,10 @@ bool VideoEncoder::start(uint32_t width, uint32_t height, const EncoderSettings&
     }
 
     color_path_ = (std::filesystem::path(settings.output_dir) / (std::wstring(L"color_") + ts + L".mp4")).wstring();
+    const std::wstring color_in_fmt = settings.color_is_rgba ? L"rgba" : L"bgra";
     const std::wstring color_cmd =
-        L"\"" + ffmpeg + L"\" -y -loglevel error -f rawvideo -pix_fmt bgra -s " + res +
-        L" -r " + fps_s + L" -i - -c:v " + h264_w + L" " + h264_opts + L" -pix_fmt yuv420p \"" + color_path_ + L"\"";
+        L"\"" + ffmpeg + L"\" -y -loglevel error -f rawvideo -pix_fmt " + color_in_fmt + L" -s " + res +
+        L" -r " + fps_s + L" -i - -vf \"pad=ceil(iw/2)*2:ceil(ih/2)*2\" -c:v " + h264_w + L" " + h264_opts + L" -pix_fmt yuv420p \"" + color_path_ + L"\"";
 
     if (!spawn_pipe(color_cmd, color_proc_)) return false;
 
@@ -153,7 +156,7 @@ bool VideoEncoder::start(uint32_t width, uint32_t height, const EncoderSettings&
             const std::wstring in_fmt = (settings.depth_mode == DepthMode::Gray8) ? L"gray" : L"rgb0";
             depth_cmd =
                 L"\"" + ffmpeg + L"\" -y -loglevel error -f rawvideo -pix_fmt " + in_fmt + L" -s " + res +
-                L" -r " + fps_s + L" -i - -c:v " + h264_w + L" " + h264_opts + L" -pix_fmt yuv420p \"" + depth_path_ + L"\"";
+                L" -r " + fps_s + L" -i - -vf \"pad=ceil(iw/2)*2:ceil(ih/2)*2\" -c:v " + h264_w + L" " + h264_opts + L" -pix_fmt yuv420p \"" + depth_path_ + L"\"";
         }
         if (!spawn_pipe(depth_cmd, depth_proc_)) {
             close_pipe(color_proc_);

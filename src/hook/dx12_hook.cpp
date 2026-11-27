@@ -116,9 +116,11 @@ struct Dx12State {
     uint32_t depth_readback_bpp[kStagingSlots]{};
     uint32_t depth_row_pitch[kStagingSlots]{};
     bool slot_pending[kStagingSlots]{};
+    bool slot_has_color[kStagingSlots]{};
     int64_t slot_qpc[kStagingSlots]{};
     uint32_t slot_mode[kStagingSlots]{};
     bool slot_has_depth[kStagingSlots]{};
+    int64_t last_preview_qpc = 0;
 
     // FPS overlay graphics pipeline
     ComPtr<ID3D12RootSignature> gfx_root_sig;
@@ -503,14 +505,16 @@ void copy_tex_to_readback(ID3D12GraphicsCommandList* cl, ID3D12Resource* src_tex
 }
 
 void record_capture_commands(ID3D12GraphicsCommandList* cl, ID3D12Resource* backbuf, uint32_t write_slot,
-                             SharedConfig* cfg, int64_t now_qpc) {
-    // Copy backbuffer -> color_readback[write_slot]
-    D3D12_RESOURCE_BARRIER b = make_transition(backbuf, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    cl->ResourceBarrier(1, &b);
-    copy_tex_to_readback(cl, backbuf, g_dx12.color_readback[write_slot].Get(),
-                         g_dx12.width, g_dx12.height, g_dx12.bb_format, g_dx12.color_row_pitch);
-    b = make_transition(backbuf, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
-    cl->ResourceBarrier(1, &b);
+                             SharedConfig* cfg, int64_t now_qpc, bool capture_color) {
+    if (capture_color) {
+        // Copy backbuffer -> color_readback[write_slot]
+        D3D12_RESOURCE_BARRIER b = make_transition(backbuf, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        cl->ResourceBarrier(1, &b);
+        copy_tex_to_readback(cl, backbuf, g_dx12.color_readback[write_slot].Get(),
+                             g_dx12.width, g_dx12.height, g_dx12.bb_format, g_dx12.color_row_pitch);
+        b = make_transition(backbuf, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
+        cl->ResourceBarrier(1, &b);
+    }
 
     const bool want_depth = (cfg && cfg->depth_enabled != 0);
     const uint32_t mode = cfg ? static_cast<uint32_t>(cfg->depth_mode) : static_cast<uint32_t>(DepthMode::Rgb24Lossless);
@@ -657,15 +661,16 @@ void record_capture_commands(ID3D12GraphicsCommandList* cl, ID3D12Resource* back
     g_dx12.slot_qpc[write_slot] = now_qpc;
     g_dx12.slot_mode[write_slot] = mode;
     g_dx12.slot_has_depth[write_slot] = captured_depth;
+    g_dx12.slot_has_color[write_slot] = capture_color;
     g_dx12.slot_pending[write_slot] = true;
 }
 
-void record_overlay_commands(ID3D12GraphicsCommandList* cl, ID3D12Resource* backbuf, double fps, bool recording, OverlayCorner corner) {
+void record_overlay_commands(ID3D12GraphicsCommandList* cl, ID3D12Resource* backbuf, double fps, double rec_fps, bool recording, OverlayCorner corner) {
     if (!g_dx12.gfx_pso) return;
 
     std::vector<uint8_t> rgba;
     uint32_t bw = 0, bh = 0;
-    render_fps_overlay_rgba(fps, recording, rgba, bw, bh);
+    render_fps_overlay_rgba(fps, rec_fps, recording, rgba, bw, bh);
 
     if (!g_dx12.font_tex || g_dx12.font_w != bw || g_dx12.font_h != bh) {
         g_dx12.font_tex = create_default_tex(g_dx12.device.Get(), bw, bh, DXGI_FORMAT_R8G8B8A8_UNORM,
@@ -753,11 +758,24 @@ void record_overlay_commands(ID3D12GraphicsCommandList* cl, ID3D12Resource* back
 }
 
 void flush_readback_slot(uint32_t read_slot, SharedConfig* cfg) {
-    if (!g_dx12.slot_pending[read_slot] || !g_dx12.color_readback[read_slot]) return;
+    if (!g_dx12.slot_pending[read_slot]) return;
     wait_fence_value(g_dx12.slot_fence_val[read_slot]);
 
-    copy_readback_tight(g_dx12.color_readback[read_slot].Get(), g_dx12.width, g_dx12.height, 4,
-                        g_dx12.color_row_pitch, g_dx12.color_pack_buf);
+    uint32_t color_bytes = 0;
+    bool is_rgba = false;
+    if (g_dx12.slot_has_color[read_slot] && g_dx12.color_readback[read_slot]) {
+        copy_readback_tight(g_dx12.color_readback[read_slot].Get(), g_dx12.width, g_dx12.height, 4,
+                            g_dx12.color_row_pitch, g_dx12.color_pack_buf);
+        if (g_dx12.bb_format == DXGI_FORMAT_R8G8B8A8_UNORM) {
+            is_rgba = true;
+        } else if (g_dx12.bb_format == DXGI_FORMAT_R10G10B10A2_UNORM) {
+            const size_t px_cnt = static_cast<size_t>(g_dx12.width) * g_dx12.height;
+            std::vector<uint8_t> tmp(px_cnt * 4);
+            unpack_r10g10b10a2_to_bgra(g_dx12.color_pack_buf.data(), tmp.data(), px_cnt, false);
+            g_dx12.color_pack_buf.swap(tmp);
+        }
+        color_bytes = static_cast<uint32_t>(g_dx12.color_pack_buf.size());
+    }
 
     uint32_t depth_bytes = 0;
     if (g_dx12.slot_has_depth[read_slot] && g_dx12.depth_readback[read_slot]) {
@@ -769,8 +787,9 @@ void flush_readback_slot(uint32_t read_slot, SharedConfig* cfg) {
 
     push_frame_to_ring(g_ipc_ring, cfg, g_dx12.frame_idx, g_dx12.slot_qpc[read_slot], g_dx12.qpc_freq,
                        g_dx12.width, g_dx12.height, g_dx12.slot_mode[read_slot], g_dx12.slot_has_depth[read_slot],
-                       g_dx12.color_pack_buf.data(), static_cast<uint32_t>(g_dx12.color_pack_buf.size()),
-                       g_dx12.depth_pack_buf.data(), depth_bytes);
+                       color_bytes ? g_dx12.color_pack_buf.data() : nullptr, color_bytes,
+                       depth_bytes ? g_dx12.depth_pack_buf.data() : nullptr, depth_bytes,
+                       is_rgba, !g_dx12.slot_has_color[read_slot]);
     g_dx12.slot_pending[read_slot] = false;
 }
 
@@ -959,18 +978,22 @@ void dx12_on_present(IDXGISwapChain* swap) {
     const double fps = tick_fps_and_telemetry(cfg, 4, g_dx12.last_qpc, g_dx12.qpc_freq,
                                               g_dx12.last_cycle_seq, g_dx12.selected_depth_idx, now_qpc);
 
-    const bool recording = (cfg && (cfg->recording != 0 || cfg->preview_enabled != 0) && g_ipc_ring.event_handle());
+    const bool is_recording = (cfg && cfg->recording != 0 && g_ipc_ring.event_handle() != nullptr);
+    const bool is_preview = (!is_recording && cfg && cfg->preview_enabled != 0 && g_ipc_ring.event_handle() != nullptr &&
+                             should_capture_preview_now(now_qpc, g_dx12.qpc_freq, g_dx12.last_preview_qpc));
+    const bool capture_now = is_recording || is_preview;
     const bool overlay = (cfg && cfg->overlay_enabled != 0);
 
-    if (recording) {
-        const uint32_t read_slot = static_cast<uint32_t>((g_dx12.frame_idx + 1) % kStagingSlots);
-        flush_readback_slot(read_slot, cfg);
+    const uint32_t write_slot = static_cast<uint32_t>(g_dx12.frame_idx % kStagingSlots);
+    if (is_recording || (cfg && cfg->preview_enabled != 0 && g_ipc_ring.event_handle())) {
+        for (uint32_t off = 1; off <= kStagingSlots; ++off) {
+            flush_readback_slot((write_slot + off) % kStagingSlots, cfg);
+        }
     } else {
         for (bool& p : g_dx12.slot_pending) p = false;
     }
 
-    if (recording || overlay) {
-        const uint32_t write_slot = static_cast<uint32_t>(g_dx12.frame_idx % kStagingSlots);
+    if (capture_now || overlay) {
         wait_fence_value(g_dx12.slot_fence_val[write_slot]);
 
         ComPtr<IDXGISwapChain3> swap3;
@@ -983,11 +1006,12 @@ void dx12_on_present(IDXGISwapChain* swap) {
             g_dx12.cmd_alloc[write_slot]->Reset();
             g_dx12.cmd_list->Reset(g_dx12.cmd_alloc[write_slot].Get(), nullptr);
 
-            if (recording) {
-                record_capture_commands(g_dx12.cmd_list.Get(), backbuf.Get(), write_slot, cfg, now_qpc);
+            if (capture_now) {
+                record_capture_commands(g_dx12.cmd_list.Get(), backbuf.Get(), write_slot, cfg, now_qpc, is_recording);
             }
             if (overlay) {
-                record_overlay_commands(g_dx12.cmd_list.Get(), backbuf.Get(), fps,
+                const double rec_fps = cfg ? (static_cast<double>(cfg->actual_rec_fps_x10) / 10.0) : 0.0;
+                record_overlay_commands(g_dx12.cmd_list.Get(), backbuf.Get(), fps, rec_fps,
                                         cfg && cfg->recording != 0,
                                         static_cast<OverlayCorner>(cfg->overlay_corner));
             }
