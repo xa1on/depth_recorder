@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 namespace dr {
 
@@ -35,8 +36,13 @@ inline double tick_fps_and_telemetry(SharedConfig* cfg, int32_t backend_id, int6
 
     if (cfg) {
         InterlockedExchange(&cfg->hooked_pid, static_cast<LONG>(GetCurrentProcessId()));
-        InterlockedExchange(&cfg->active_backend, backend_id);
+        const LONG prev_backend = InterlockedExchange(&cfg->active_backend, backend_id);
+        if (prev_backend != backend_id) {
+            const char* name = backend_id == 1 ? "DX11" : backend_id == 2 ? "GL" : backend_id == 3 ? "VK" : "DX12";
+            log_push(cfg, name, "Hook active (pid=%lu)", GetCurrentProcessId());
+        }
         InterlockedExchange(&cfg->current_fps_x10, static_cast<LONG>(fps * 10.0));
+        if (cfg->recording) InterlockedIncrement(&cfg->presented_frames);
         if (cfg->cycle_depth_seq != last_cycle_seq) {
             last_cycle_seq = cfg->cycle_depth_seq;
             selected_depth_idx++;
@@ -48,7 +54,10 @@ inline double tick_fps_and_telemetry(SharedConfig* cfg, int32_t backend_id, int6
 inline bool select_depth_candidate(const std::vector<DepthCandidate>& ranked, SharedConfig* cfg,
                                    uint32_t& selected_depth_idx, DepthCandidate& out_cand) {
     if (cfg) {
-        InterlockedExchange(&cfg->candidate_depth_count, static_cast<LONG>(ranked.size()));
+        const LONG prev_cnt = InterlockedExchange(&cfg->candidate_depth_count, static_cast<LONG>(ranked.size()));
+        if (prev_cnt != static_cast<LONG>(ranked.size())) {
+            log_push(cfg, "DEPTH", "Depth candidates: %zu", ranked.size());
+        }
         if (!ranked.empty()) {
             selected_depth_idx %= static_cast<uint32_t>(ranked.size());
             InterlockedExchange(&cfg->selected_depth_index, static_cast<LONG>(selected_depth_idx));
@@ -68,30 +77,64 @@ inline bool should_capture_preview_now(int64_t now_qpc, int64_t qpc_freq, int64_
     return false;
 }
 
-inline void push_frame_to_ring(IpcRing& ring, SharedConfig* cfg, uint64_t frame_idx,
-                               int64_t qpc_ts, int64_t qpc_freq, uint32_t w, uint32_t h,
-                               uint32_t mode, bool has_depth,
-                               const void* color_data, uint32_t color_bytes,
-                               const void* depth_data, uint32_t depth_bytes,
-                               bool color_is_rgba = false, bool is_preview_only = false) {
-    FrameHeader hdr{};
-    hdr.frame_index = frame_idx;
-    hdr.qpc_timestamp = qpc_ts;
-    hdr.qpc_freq = qpc_freq;
-    hdr.width = w;
-    hdr.height = h;
-    hdr.color_bytes = is_preview_only ? 0 : color_bytes;
-    hdr.depth_bytes = has_depth ? depth_bytes : 0;
-    hdr.depth_mode = mode;
-    hdr.has_depth = has_depth ? 1 : 0;
-    hdr.color_is_rgba = color_is_rgba ? 1 : 0;
-    hdr.is_preview_only = is_preview_only ? 1 : 0;
+inline bool should_capture_recording_now(int64_t now_qpc, int64_t qpc_freq, uint32_t target_fps, int64_t& next_capture_qpc) {
+    if (qpc_freq <= 0 || target_fps == 0) return true;
+    const int64_t period = qpc_freq / std::clamp<uint32_t>(target_fps, 1, 240);
+    if (period == 0) return true;
+    if (!next_capture_qpc) next_capture_qpc = now_qpc;
+    // A slightly early present can fill the next slot without shifting the capture clock.
+    const int64_t eligible = now_qpc + period / 4;
+    if (eligible < next_capture_qpc) return false;
+    next_capture_qpc += ((eligible - next_capture_qpc) / period + 1) * period;
+    return true;
+}
 
-    if (!ring.try_push(hdr, hdr.color_bytes ? color_data : nullptr,
-                       (has_depth && depth_bytes > 0) ? depth_data : nullptr)) {
-        if (cfg && !is_preview_only) InterlockedIncrement(&cfg->dropped_frames);
+inline void publish_frame(IpcRing& ring, SharedConfig* cfg, const FrameHeader& hdr) {
+    ring.commit_push(hdr);
+    if (cfg && !hdr.is_preview_only && hdr.color_bytes && (hdr.has_depth || !cfg->depth_enabled) &&
+        cfg->capture_generation == hdr.capture_generation && cfg->target_pid == static_cast<LONG>(hdr.producer_pid)) {
+        InterlockedIncrement(&cfg->published_pairs);
     }
 }
+
+inline RecordingActivity recording_activity(const SharedConfig* cfg) {
+    return cfg ? static_cast<RecordingActivity>(cfg->recording_activity) : RecordingActivity::Normal;
+}
+
+struct OverlayBitmapCache {
+    std::string last_text;
+    bool last_recording = false;
+    int64_t last_update_qpc = 0;
+    std::vector<uint8_t> rgba;
+    uint32_t bw = 0;
+    uint32_t bh = 0;
+
+    bool update(double fps, double rec_fps, bool recording, RecordingActivity activity, int64_t now_qpc, int64_t qpc_freq) {
+        // Throttle text re-rasterization to 4 Hz while always keeping a valid initial bitmap.
+        if (bw > 0 && bh > 0 && last_recording == recording && qpc_freq > 0 &&
+            last_update_qpc != 0 && (now_qpc - last_update_qpc) < (qpc_freq / 4)) {
+            return false;
+        }
+        last_update_qpc = now_qpc;
+        char text[48]{};
+        if (recording && activity == RecordingActivity::WaitingForCapture) {
+            std::snprintf(text, sizeof(text), "%.0f - rec: WAIT", fps);
+        } else if (recording && activity == RecordingActivity::EncoderStalled) {
+            std::snprintf(text, sizeof(text), "%.0f - rec: STALL", fps);
+        } else if (recording) {
+            std::snprintf(text, sizeof(text), "%.0f - rec: %.0f", fps, rec_fps);
+        } else {
+            std::snprintf(text, sizeof(text), "%.0f", fps);
+        }
+        if (bw > 0 && bh > 0 && last_recording == recording && last_text == text) {
+            return false;
+        }
+        last_text = text;
+        last_recording = recording;
+        render_fps_bitmap(text, recording, rgba, bw, bh);
+        return true;
+    }
+};
 
 inline void compute_overlay_pixel_rect(uint32_t bw, uint32_t bh, uint32_t view_w, uint32_t view_h,
                                        OverlayCorner corner, int32_t& out_x, int32_t& out_y) {
@@ -122,23 +165,6 @@ inline void compute_overlay_ndc_rect(uint32_t bw, uint32_t bh, uint32_t view_w, 
     out_ndc[3] = y1;
 }
 
-inline void render_fps_overlay_rgba(double fps, double rec_fps, bool recording,
-                                    std::vector<uint8_t>& out_rgba, uint32_t& out_bw, uint32_t& out_bh) {
-    char text[48]{};
-    if (recording) {
-        std::snprintf(text, sizeof(text), "%.0f - rec: %.0f", fps, rec_fps);
-    } else {
-        std::snprintf(text, sizeof(text), "%.0f", fps);
-    }
-    render_fps_bitmap(text, recording, out_rgba, out_bw, out_bh);
-}
-
-inline void swizzle_rgba_to_bgra(uint8_t* bgra, size_t pixel_count) {
-    for (size_t i = 0; i < pixel_count; ++i) {
-        std::swap(bgra[i * 4 + 0], bgra[i * 4 + 2]);
-    }
-}
-
 inline void unpack_r10g10b10a2_to_bgra(const uint8_t* src, uint8_t* dst_bgra, size_t pixel_count, bool bgr_order) {
     const auto* p32 = reinterpret_cast<const uint32_t*>(src);
     for (size_t i = 0; i < pixel_count; ++i) {
@@ -162,9 +188,15 @@ struct DepthConvertParams {
     float z_near;
     float z_far;
     float pad;
+    float source_scale_x;
+    float source_scale_y;
+    float source_left;
+    float source_top;
 };
 
-inline DepthConvertParams make_depth_convert_params(uint32_t w, uint32_t h, uint32_t mode, const SharedConfig* cfg) {
+inline DepthConvertParams make_depth_convert_params(uint32_t w, uint32_t h, uint32_t source_w, uint32_t source_h,
+                                                     uint32_t mode, const SharedConfig* cfg,
+                                                     const DepthRegion* region = nullptr) {
     DepthConvertParams p{};
     p.width = w;
     p.height = h;
@@ -173,6 +205,16 @@ inline DepthConvertParams make_depth_convert_params(uint32_t w, uint32_t h, uint
     p.reversed_z = cfg ? static_cast<uint32_t>(cfg->reversed_z) : 1;
     p.z_near = cfg ? cfg->z_near : 0.1f;
     p.z_far = cfg ? cfg->z_far : 500.0f;
+    p.source_scale_x = static_cast<float>(source_w) / static_cast<float>(w);
+    p.source_scale_y = static_cast<float>(source_h) / static_cast<float>(h);
+    if (region && region->left >= 0 && region->top >= 0 && region->width >= 64 && region->height >= 64 &&
+        region->left + region->width <= source_w && region->top + region->height <= source_h &&
+        DepthHeuristic::is_plausible_size(static_cast<uint32_t>(region->width), static_cast<uint32_t>(region->height), w, h)) {
+        p.source_left = region->left;
+        p.source_top = region->top;
+        p.source_scale_x = region->width / static_cast<float>(w);
+        p.source_scale_y = region->height / static_cast<float>(h);
+    }
     return p;
 }
 

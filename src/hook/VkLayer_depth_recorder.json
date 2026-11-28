@@ -6,17 +6,14 @@
     "library_path": ".\\VkLayer_depth_recorder.dll",
     "api_version": "1.3.0",
     "implementation_version": "1",
-    "description": "Depth Recorder implicit capture layer",
+    "description": "Depth Recorder capture layer",
+    "disable_environment": {
+      "DISABLE_VK_LAYER_DEPTH_RECORDER": "1"
+    },
     "functions": {
       "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion",
       "vkGetInstanceProcAddr": "vkGetInstanceProcAddr",
       "vkGetDeviceProcAddr": "vkGetDeviceProcAddr"
-    },
-    "enable_environment": {
-      "ENABLE_DEPTH_RECORDER_LAYER": "1"
-    },
-    "disable_environment": {
-      "DISABLE_DEPTH_RECORDER_LAYER": "1"
     }
   }
 }

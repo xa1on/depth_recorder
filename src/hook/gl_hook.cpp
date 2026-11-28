@@ -1,5 +1,5 @@
 #include "gl_hook.h"
-#include "hook_common.h"
+#include "slot_ring.h"
 #include "fps_overlay_font.h"
 
 #include <MinHook.h>
@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -60,6 +61,7 @@ constexpr GLenum kGL_BLEND_SRC_ALPHA = 0x80CB;
 constexpr GLenum kGL_BLEND_DST_ALPHA = 0x80CA;
 constexpr GLenum kGL_TEXTURE_WIDTH = 0x1000;
 constexpr GLenum kGL_TEXTURE_HEIGHT = 0x1001;
+constexpr GLenum kGL_TEXTURE_2D_MULTISAMPLE = 0x9100;
 
 constexpr uint32_t kPboSlots = 3;
 constexpr uintptr_t kDefaultFboDepthKey = 0xFFFFFFFFULL;
@@ -68,6 +70,7 @@ constexpr uintptr_t kDefaultFboDepthKey = 0xFFFFFFFFULL;
 using PFN_wglSwapBuffers = BOOL(WINAPI*)(HDC);
 using PFN_wglGetProcAddress = PROC(WINAPI*)(LPCSTR);
 using PFN_glClear = void(APIENTRY*)(GLbitfield);
+using PFN_glViewport = void(APIENTRY*)(GLint, GLint, GLsizei, GLsizei);
 using PFN_glDrawArrays = void(APIENTRY*)(GLenum, GLint, GLsizei);
 using PFN_glDrawElements = void(APIENTRY*)(GLenum, GLsizei, GLenum, const void*);
 using PFN_glEnd = void(APIENTRY*)();
@@ -84,6 +87,9 @@ using PFN_glGenBuffers = void(APIENTRY*)(GLsizei, GLuint*);
 using PFN_glDeleteBuffers = void(APIENTRY*)(GLsizei, const GLuint*);
 using PFN_glBindBuffer = void(APIENTRY*)(GLenum, GLuint);
 using PFN_glBufferData = void(APIENTRY*)(GLenum, GLsizeiptr, const void*, GLenum);
+using PFN_glFenceSync = void*(APIENTRY*)(GLenum, GLbitfield);
+using PFN_glClientWaitSync = GLenum(APIENTRY*)(void*, GLbitfield, uint64_t);
+using PFN_glDeleteSync = void(APIENTRY*)(void*);
 using PFN_glMapBuffer = void*(APIENTRY*)(GLenum, GLenum);
 using PFN_glUnmapBuffer = GLboolean(APIENTRY*)(GLenum);
 using PFN_glCreateShader = GLuint(APIENTRY*)(GLenum);
@@ -100,6 +106,7 @@ using PFN_glUseProgram = void(APIENTRY*)(GLuint);
 using PFN_glGetUniformLocation = GLint(APIENTRY*)(GLuint, const GLchar*);
 using PFN_glUniform1i = void(APIENTRY*)(GLint, GLint);
 using PFN_glUniform1f = void(APIENTRY*)(GLint, GLfloat);
+using PFN_glUniform2f = void(APIENTRY*)(GLint, GLfloat, GLfloat);
 using PFN_glUniform4f = void(APIENTRY*)(GLint, GLfloat, GLfloat, GLfloat, GLfloat);
 using PFN_glActiveTexture = void(APIENTRY*)(GLenum);
 using PFN_glGenVertexArrays = void(APIENTRY*)(GLsizei, GLuint*);
@@ -111,6 +118,7 @@ using PFN_glBlendFuncSeparate = void(APIENTRY*)(GLenum, GLenum, GLenum, GLenum);
 PFN_wglSwapBuffers oWglSwapBuffers = nullptr;
 PFN_wglGetProcAddress oWglGetProcAddress = nullptr;
 PFN_glClear oGlClear = nullptr;
+PFN_glViewport oGlViewport = nullptr;
 PFN_glDrawArrays oGlDrawArrays = nullptr;
 PFN_glDrawElements oGlDrawElements = nullptr;
 PFN_glEnd oGlEnd = nullptr;
@@ -132,6 +140,9 @@ struct GlDispatch {
     PFN_glDeleteBuffers DeleteBuffers = nullptr;
     PFN_glBindBuffer BindBuffer = nullptr;
     PFN_glBufferData BufferData = nullptr;
+    PFN_glFenceSync FenceSync = nullptr;
+    PFN_glClientWaitSync ClientWaitSync = nullptr;
+    PFN_glDeleteSync DeleteSync = nullptr;
     PFN_glMapBuffer MapBuffer = nullptr;
     PFN_glUnmapBuffer UnmapBuffer = nullptr;
     PFN_glCreateShader CreateShader = nullptr;
@@ -148,6 +159,7 @@ struct GlDispatch {
     PFN_glGetUniformLocation GetUniformLocation = nullptr;
     PFN_glUniform1i Uniform1i = nullptr;
     PFN_glUniform1f Uniform1f = nullptr;
+    PFN_glUniform2f Uniform2f = nullptr;
     PFN_glUniform4f Uniform4f = nullptr;
     PFN_glActiveTexture ActiveTexture = nullptr;
     PFN_glGenVertexArrays GenVertexArrays = nullptr;
@@ -160,6 +172,19 @@ struct FboDepthInfo {
     GLuint tex = 0;
     uint32_t width = 0;
     uint32_t height = 0;
+    bool multisampled = false;
+};
+
+struct DepthProg {
+    GLuint prog = 0;
+    GLint depth_tex = -1;
+    GLint mode = -1;
+    GLint linearize = -1;
+    GLint reversed_z = -1;
+    GLint z_near = -1;
+    GLint z_far = -1;
+    GLint source_scale = -1;
+    GLint source_offset = -1;
 };
 
 struct GlState {
@@ -177,13 +202,8 @@ struct GlState {
     GLuint dummy_vao = 0;
 
     // Depth conversion pipeline
-    GLuint depth_prog = 0;
-    GLint loc_depth_tex = -1;
-    GLint loc_mode = -1;
-    GLint loc_linearize = -1;
-    GLint loc_reversed_z = -1;
-    GLint loc_z_near = -1;
-    GLint loc_z_far = -1;
+    DepthProg depth_2d;
+    DepthProg depth_msaa;
 
     GLuint depth_conv_fbo = 0;
     GLuint out_gray_tex = 0;
@@ -199,12 +219,11 @@ struct GlState {
     GLuint color_pbo[kPboSlots]{};
     GLuint depth_pbo[kPboSlots]{};
     uint32_t depth_pbo_bpp[kPboSlots]{};
-    bool slot_pending[kPboSlots]{};
-    bool slot_has_color[kPboSlots]{};
-    int64_t slot_qpc[kPboSlots]{};
-    uint32_t slot_mode[kPboSlots]{};
-    bool slot_has_depth[kPboSlots]{};
+    void* slot_fence[kPboSlots]{};
+    CaptureSlotTracker<kPboSlots> slots;
+    LONG last_capture_generation = -1;
     int64_t last_preview_qpc = 0;
+    int64_t last_cap_qpc = 0;
 
     // FPS overlay resources
     GLuint overlay_prog = 0;
@@ -213,9 +232,11 @@ struct GlState {
     GLuint font_tex = 0;
     uint32_t font_w = 0;
     uint32_t font_h = 0;
+    OverlayBitmapCache overlay_cache;
 
-    // FBO tracking
+    // FBO & viewport tracking
     GLuint current_draw_fbo = 0;
+    DepthRegion render_region{};
     std::unordered_map<GLuint, FboDepthInfo> fbo_depths;
 
     DepthHeuristic heuristic;
@@ -247,6 +268,9 @@ bool load_gl_dispatch() {
     ok &= load_proc(g_gl_fn.DeleteBuffers, "glDeleteBuffers");
     ok &= load_proc(g_gl_fn.BindBuffer, "glBindBuffer");
     ok &= load_proc(g_gl_fn.BufferData, "glBufferData");
+    ok &= load_proc(g_gl_fn.FenceSync, "glFenceSync");
+    ok &= load_proc(g_gl_fn.ClientWaitSync, "glClientWaitSync");
+    ok &= load_proc(g_gl_fn.DeleteSync, "glDeleteSync");
     ok &= load_proc(g_gl_fn.MapBuffer, "glMapBuffer");
     ok &= load_proc(g_gl_fn.UnmapBuffer, "glUnmapBuffer");
     ok &= load_proc(g_gl_fn.CreateShader, "glCreateShader");
@@ -263,6 +287,7 @@ bool load_gl_dispatch() {
     ok &= load_proc(g_gl_fn.GetUniformLocation, "glGetUniformLocation");
     ok &= load_proc(g_gl_fn.Uniform1i, "glUniform1i");
     ok &= load_proc(g_gl_fn.Uniform1f, "glUniform1f");
+    ok &= load_proc(g_gl_fn.Uniform2f, "glUniform2f");
     ok &= load_proc(g_gl_fn.Uniform4f, "glUniform4f");
     ok &= load_proc(g_gl_fn.ActiveTexture, "glActiveTexture");
     ok &= load_proc(g_gl_fn.GenVertexArrays, "glGenVertexArrays");
@@ -319,13 +344,27 @@ void main() {
 }
 )";
 
-const char* kDepthConvertFS = R"(#version 330 core
+const char* kDepthConvertFS_2D = R"(#version 330 core
 uniform sampler2D uDepthTex;
+#define FETCH_DEPTH(coord) texelFetch(uDepthTex, coord, 0).r
+#define DEPTH_SIZE() textureSize(uDepthTex, 0)
+)";
+
+const char* kDepthConvertFS_MSAA = R"(#version 330 core
+uniform sampler2DMS uDepthTex;
+#define FETCH_DEPTH(coord) texelFetch(uDepthTex, coord, 0).r
+#define DEPTH_SIZE() textureSize(uDepthTex)
+)";
+
+const char* kDepthConvertFS_Body = R"(
+in vec2 vUV;
 uniform int uMode;
 uniform int uLinearize;
 uniform int uReversedZ;
 uniform float uZNear;
 uniform float uZFar;
+uniform vec2 uSourceScale;
+uniform vec2 uSourceOffset;
 layout(location = 0) out vec4 oColor;
 
 float LinearizeDepth(float d) {
@@ -338,7 +377,10 @@ float LinearizeDepth(float d) {
 }
 
 void main() {
-    float d_raw = clamp(texelFetch(uDepthTex, ivec2(gl_FragCoord.xy), 0).r, 0.0, 1.0);
+    ivec2 sz = DEPTH_SIZE();
+    vec2 uv = clamp(vUV * uSourceScale + uSourceOffset, vec2(0.0), vec2(0.999999));
+    ivec2 coord = clamp(ivec2(uv * vec2(sz)), ivec2(0), sz - ivec2(1));
+    float d_raw = clamp(FETCH_DEPTH(coord), 0.0, 1.0);
     if (uMode == 0) {
         float d = (uLinearize != 0) ? LinearizeDepth(d_raw) : d_raw;
         oColor = vec4(d, 0.0, 0.0, 1.0);
@@ -359,6 +401,23 @@ void main() {
     oColor = vec4(r, g, b, 1.0);
 }
 )";
+
+DepthProg build_depth_prog(const char* header) {
+    DepthProg dp{};
+    std::string fs = std::string(header) + kDepthConvertFS_Body;
+    dp.prog = link_program(kFullscreenVS, fs.c_str());
+    if (dp.prog) {
+        dp.depth_tex = g_gl_fn.GetUniformLocation(dp.prog, "uDepthTex");
+        dp.mode = g_gl_fn.GetUniformLocation(dp.prog, "uMode");
+        dp.linearize = g_gl_fn.GetUniformLocation(dp.prog, "uLinearize");
+        dp.reversed_z = g_gl_fn.GetUniformLocation(dp.prog, "uReversedZ");
+        dp.z_near = g_gl_fn.GetUniformLocation(dp.prog, "uZNear");
+        dp.z_far = g_gl_fn.GetUniformLocation(dp.prog, "uZFar");
+        dp.source_scale = g_gl_fn.GetUniformLocation(dp.prog, "uSourceScale");
+        dp.source_offset = g_gl_fn.GetUniformLocation(dp.prog, "uSourceOffset");
+    }
+    return dp;
+}
 
 const char* kOverlayVS = R"(#version 330 core
 uniform vec4 uRect; // xy = min_ndc, zw = max_ndc
@@ -394,6 +453,9 @@ struct GlStateGuard {
     GLint tex2d = 0;
     GLint pbo = 0;
     GLint pack_align = 4;
+    GLint pack_row_length = 0;
+    GLint pack_skip_rows = 0;
+    GLint pack_skip_pixels = 0;
     GLint unpack_align = 4;
     GLint read_buf = GL_BACK;
     GLint vp[4]{};
@@ -415,6 +477,9 @@ struct GlStateGuard {
         glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex2d);
         glGetIntegerv(kGL_PIXEL_PACK_BUFFER_BINDING, &pbo);
         glGetIntegerv(GL_PACK_ALIGNMENT, &pack_align);
+        glGetIntegerv(0x0D02, &pack_row_length);
+        glGetIntegerv(0x0D03, &pack_skip_rows);
+        glGetIntegerv(0x0D04, &pack_skip_pixels);
         glGetIntegerv(GL_UNPACK_ALIGNMENT, &unpack_align);
         glGetIntegerv(GL_READ_BUFFER, &read_buf);
         glGetIntegerv(GL_VIEWPORT, vp);
@@ -439,6 +504,9 @@ struct GlStateGuard {
         g_gl_fn.ActiveTexture(static_cast<GLenum>(active_tex));
         g_gl_fn.BindBuffer(kGL_PIXEL_PACK_BUFFER, static_cast<GLuint>(pbo));
         glPixelStorei(GL_PACK_ALIGNMENT, pack_align);
+        glPixelStorei(0x0D02, pack_row_length);
+        glPixelStorei(0x0D03, pack_skip_rows);
+        glPixelStorei(0x0D04, pack_skip_pixels);
         glPixelStorei(GL_UNPACK_ALIGNMENT, unpack_align);
         glReadBuffer(static_cast<GLenum>(read_buf));
         glViewport(vp[0], vp[1], vp[2], vp[3]);
@@ -454,11 +522,13 @@ struct GlStateGuard {
 
 void release_size_dependent() {
     if (!g_gl_fn.loaded || !wglGetCurrentContext()) return;
+    g_gl.slots.reset_all();
     for (uint32_t i = 0; i < kPboSlots; ++i) {
         if (g_gl.color_pbo[i]) { g_gl_fn.DeleteBuffers(1, &g_gl.color_pbo[i]); g_gl.color_pbo[i] = 0; }
         if (g_gl.depth_pbo[i]) { g_gl_fn.DeleteBuffers(1, &g_gl.depth_pbo[i]); g_gl.depth_pbo[i] = 0; }
         g_gl.depth_pbo_bpp[i] = 0;
-        g_gl.slot_pending[i] = false;
+        if (g_gl.slot_fence[i]) g_gl_fn.DeleteSync(g_gl.slot_fence[i]);
+        g_gl.slot_fence[i] = nullptr;
     }
     auto del_tex = [](GLuint& t) {
         if (t) { glDeleteTextures(1, &t); t = 0; }
@@ -488,6 +558,11 @@ bool ensure_pipeline(HDC hdc) {
     HGLRC ctx = wglGetCurrentContext();
     if (!ctx) return false;
     if (!load_gl_dispatch()) return false;
+    if (g_gl.initialized && g_gl.hglrc != ctx) {
+        const bool hooks = g_gl.hooks_installed;
+        g_gl = GlState{};
+        g_gl.hooks_installed = hooks;
+    }
 
     if (!g_gl.initialized) {
         g_gl.hglrc = ctx;
@@ -498,15 +573,8 @@ bool ensure_pipeline(HDC hdc) {
         g_gl_fn.GenVertexArrays(1, &g_gl.dummy_vao);
         g_gl_fn.GenFramebuffers(1, &g_gl.depth_conv_fbo);
 
-        g_gl.depth_prog = link_program(kFullscreenVS, kDepthConvertFS);
-        if (g_gl.depth_prog) {
-            g_gl.loc_depth_tex = g_gl_fn.GetUniformLocation(g_gl.depth_prog, "uDepthTex");
-            g_gl.loc_mode = g_gl_fn.GetUniformLocation(g_gl.depth_prog, "uMode");
-            g_gl.loc_linearize = g_gl_fn.GetUniformLocation(g_gl.depth_prog, "uLinearize");
-            g_gl.loc_reversed_z = g_gl_fn.GetUniformLocation(g_gl.depth_prog, "uReversedZ");
-            g_gl.loc_z_near = g_gl_fn.GetUniformLocation(g_gl.depth_prog, "uZNear");
-            g_gl.loc_z_far = g_gl_fn.GetUniformLocation(g_gl.depth_prog, "uZFar");
-        }
+        g_gl.depth_2d = build_depth_prog(kDepthConvertFS_2D);
+        g_gl.depth_msaa = build_depth_prog(kDepthConvertFS_MSAA);
 
         g_gl.overlay_prog = link_program(kOverlayVS, kOverlayFS);
         if (g_gl.overlay_prog) {
@@ -560,41 +628,47 @@ void ensure_depth_pbo(uint32_t slot, uint32_t bpp) {
     g_gl.depth_pbo_bpp[slot] = bpp;
 }
 
-void copy_pbo_flipped(GLuint pbo, uint32_t w, uint32_t h, uint32_t bpp, std::vector<uint8_t>& dst) {
+bool copy_pbo_flipped_to(GLuint pbo, uint32_t w, uint32_t h, uint32_t bpp, uint8_t* dst) {
     g_gl_fn.BindBuffer(kGL_PIXEL_PACK_BUFFER, pbo);
     const auto* src = static_cast<const uint8_t*>(g_gl_fn.MapBuffer(kGL_PIXEL_PACK_BUFFER, kGL_READ_ONLY));
     if (src) {
         const size_t row_bytes = static_cast<size_t>(w) * bpp;
-        dst.resize(row_bytes * h);
         for (uint32_t y = 0; y < h; ++y) {
-            std::memcpy(dst.data() + static_cast<size_t>(y) * row_bytes,
+            std::memcpy(dst + static_cast<size_t>(y) * row_bytes,
                         src + static_cast<size_t>(h - 1 - y) * row_bytes, row_bytes);
         }
-        g_gl_fn.UnmapBuffer(kGL_PIXEL_PACK_BUFFER);
+        const bool valid = g_gl_fn.UnmapBuffer(kGL_PIXEL_PACK_BUFFER) == GL_TRUE;
+        g_gl_fn.BindBuffer(kGL_PIXEL_PACK_BUFFER, 0);
+        return valid;
     }
     g_gl_fn.BindBuffer(kGL_PIXEL_PACK_BUFFER, 0);
+    return false;
 }
 
-void draw_fps_overlay(double fps, double rec_fps, bool recording, OverlayCorner corner) {
+void draw_fps_overlay(double fps, double rec_fps, bool recording, RecordingActivity activity,
+                      int64_t now_qpc, int64_t qpc_freq, OverlayCorner corner) {
     if (!g_gl.overlay_prog || g_gl.width == 0 || g_gl.height == 0) return;
 
-    std::vector<uint8_t> rgba;
-    uint32_t bw = 0, bh = 0;
-    render_fps_overlay_rgba(fps, rec_fps, recording, rgba, bw, bh);
+    const bool text_changed = g_gl.overlay_cache.update(fps, rec_fps, recording, activity, now_qpc, qpc_freq);
+    const uint32_t bw = g_gl.overlay_cache.bw;
+    const uint32_t bh = g_gl.overlay_cache.bh;
 
     GlStateGuard guard;
 
-    if (!g_gl.font_tex || g_gl.font_w != bw || g_gl.font_h != bh) {
+    const bool recreated = (!g_gl.font_tex || g_gl.font_w != bw || g_gl.font_h != bh);
+    if (recreated) {
         if (g_gl.font_tex) glDeleteTextures(1, &g_gl.font_tex);
         g_gl.font_tex = create_tex2d(bw, bh, kGL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE);
         g_gl.font_w = bw;
         g_gl.font_h = bh;
     }
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     g_gl_fn.ActiveTexture(kGL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, g_gl.font_tex);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, static_cast<GLsizei>(bw), static_cast<GLsizei>(bh),
-                    GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+    if (text_changed || recreated) {
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, static_cast<GLsizei>(bw), static_cast<GLsizei>(bh),
+                        GL_RGBA, GL_UNSIGNED_BYTE, g_gl.overlay_cache.rgba.data());
+    }
 
     float ndc_rect[4]{};
     compute_overlay_ndc_rect(bw, bh, g_gl.width, g_gl.height, corner, ndc_rect);
@@ -614,33 +688,142 @@ void draw_fps_overlay(double fps, double rec_fps, bool recording, OverlayCorner 
     glDrawArrays(GL_TRIANGLES, 0, 6);
 }
 
-void capture_frame(SharedConfig* cfg, int64_t now_qpc, bool capture_color) {
+void flush_pending_slots(SharedConfig* cfg, LONG generation) {
     GlStateGuard guard;
-
-    const uint32_t write_slot = static_cast<uint32_t>(g_gl.frame_idx % kPboSlots);
-    for (uint32_t off = 1; off <= kPboSlots; ++off) {
-        const uint32_t read_slot = (write_slot + off) % kPboSlots;
-        if (!g_gl.slot_pending[read_slot]) continue;
-
-        uint32_t color_bytes = 0;
-        if (g_gl.slot_has_color[read_slot] && g_gl.color_pbo[read_slot]) {
-            copy_pbo_flipped(g_gl.color_pbo[read_slot], g_gl.width, g_gl.height, 4, g_gl.color_pack_buf);
-            color_bytes = static_cast<uint32_t>(g_gl.color_pack_buf.size());
+    while (true) {
+        const uint32_t read_slot = g_gl.slots.pick_oldest_pending(generation);
+        if (read_slot >= kPboSlots) break;
+        const GLenum wait = g_gl_fn.ClientWaitSync(g_gl.slot_fence[read_slot], 0, 0);
+        if (wait == 0x911B /* GL_TIMEOUT_EXPIRED */) break;
+        if (wait == 0x911D /* GL_WAIT_FAILED */) {
+            g_gl_fn.DeleteSync(g_gl.slot_fence[read_slot]);
+            g_gl.slot_fence[read_slot] = nullptr;
+            g_gl.slots.slots[read_slot].pending = false;
+            continue;
         }
-        uint32_t depth_bytes = 0;
-        if (g_gl.slot_has_depth[read_slot] && g_gl.depth_pbo[read_slot]) {
-            const uint32_t bpp = g_gl.depth_pbo_bpp[read_slot];
-            copy_pbo_flipped(g_gl.depth_pbo[read_slot], g_gl.width, g_gl.height, bpp, g_gl.depth_pack_buf);
-            depth_bytes = static_cast<uint32_t>(g_gl.depth_pack_buf.size());
+
+        const auto& meta = g_gl.slots.slots[read_slot];
+        const bool has_color = meta.has_color && g_gl.color_pbo[read_slot];
+        const bool has_depth = meta.has_depth && g_gl.depth_pbo[read_slot];
+        const bool published = g_gl.slots.try_publish_slot(
+            read_slot, g_ipc_ring, cfg, g_gl.frame_idx, g_gl.qpc_freq, g_gl.width, g_gl.height,
+            [&](uint8_t* dst) -> bool {
+                return has_color && copy_pbo_flipped_to(g_gl.color_pbo[read_slot], g_gl.width, g_gl.height, 4, dst);
+            },
+            [&](uint8_t* dst) -> bool {
+                return has_depth && copy_pbo_flipped_to(g_gl.depth_pbo[read_slot], g_gl.width, g_gl.height,
+                                                        g_gl.depth_pbo_bpp[read_slot], dst);
+            });
+        if (!published) break;
+        g_gl_fn.DeleteSync(g_gl.slot_fence[read_slot]);
+        g_gl.slot_fence[read_slot] = nullptr;
+    }
+}
+
+void capture_frame(SharedConfig* cfg, int64_t now_qpc, bool preview_only, LONG generation) {
+    GlStateGuard guard;
+    const uint32_t write_slot = g_gl.slots.acquire_free_slot();
+    if (write_slot >= kPboSlots) return;
+
+    const bool want_depth = (cfg && cfg->depth_enabled != 0);
+    const uint32_t mode = cfg ? static_cast<uint32_t>(cfg->depth_mode) : static_cast<uint32_t>(DepthMode::Rgb24Lossless);
+    bool captured_depth = false;
+    uint32_t depth_bpp = 0;
+
+    DepthCandidate cand{};
+    const bool has_cand = select_depth_candidate(g_gl.heuristic.ranked_candidates(), cfg, g_gl.selected_depth_idx, cand);
+
+    if (want_depth && has_cand && g_gl.depth_conv_fbo) {
+        GLuint depth_tex = 0;
+        bool multisampled = false;
+        if (g_gl.clear_snap_valid_this_frame && g_gl.clear_snap_key == cand.key && g_gl.clear_snap_tex) {
+            depth_tex = g_gl.clear_snap_tex;
+        } else if (cand.key == kDefaultFboDepthKey) {
+            g_gl_fn.BindFramebuffer(kGL_READ_FRAMEBUFFER, 0);
+            glBindTexture(GL_TEXTURE_2D, g_gl.default_depth_tex);
+            glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
+                                static_cast<GLsizei>(g_gl.width), static_cast<GLsizei>(g_gl.height));
+            depth_tex = g_gl.default_depth_tex;
+        } else {
+            depth_tex = static_cast<GLuint>(cand.key);
+            for (const auto& [fbo_id, info] : g_gl.fbo_depths) {
+                if (info.tex == depth_tex) {
+                    multisampled = info.multisampled;
+                    break;
+                }
+            }
         }
-        push_frame_to_ring(g_ipc_ring, cfg, g_gl.frame_idx, g_gl.slot_qpc[read_slot], g_gl.qpc_freq,
-                           g_gl.width, g_gl.height, g_gl.slot_mode[read_slot], g_gl.slot_has_depth[read_slot],
-                           color_bytes ? g_gl.color_pack_buf.data() : nullptr, color_bytes,
-                           depth_bytes ? g_gl.depth_pack_buf.data() : nullptr, depth_bytes,
-                           false, !g_gl.slot_has_color[read_slot]);
-        g_gl.slot_pending[read_slot] = false;
+
+        const DepthProg& dp = (multisampled && g_gl.depth_msaa.prog) ? g_gl.depth_msaa : g_gl.depth_2d;
+        if (depth_tex != 0 && dp.prog) {
+            depth_bpp = (mode == static_cast<uint32_t>(DepthMode::Gray8)) ? 1 : 4;
+            const GLuint out_tex = (depth_bpp == 1) ? g_gl.out_gray_tex : g_gl.out_rgba_tex;
+
+            g_gl_fn.BindFramebuffer(kGL_DRAW_FRAMEBUFFER, g_gl.depth_conv_fbo);
+            g_gl_fn.FramebufferTexture2D(kGL_DRAW_FRAMEBUFFER, kGL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, out_tex, 0);
+            if (g_gl_fn.CheckFramebufferStatus(kGL_DRAW_FRAMEBUFFER) == kGL_FRAMEBUFFER_COMPLETE) {
+                const GLenum tex_target = multisampled ? kGL_TEXTURE_2D_MULTISAMPLE : GL_TEXTURE_2D;
+                g_gl_fn.ActiveTexture(kGL_TEXTURE0);
+                glBindTexture(tex_target, depth_tex);
+                GLint prev_cmp = GL_NONE, prev_min = GL_NEAREST, prev_mag = GL_NEAREST;
+                if (!multisampled) {
+                glGetTexParameteriv(GL_TEXTURE_2D, kGL_TEXTURE_COMPARE_MODE, &prev_cmp);
+                glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, &prev_min);
+                glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, &prev_mag);
+                glTexParameteri(GL_TEXTURE_2D, kGL_TEXTURE_COMPARE_MODE, GL_NONE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+                }
+                glViewport(0, 0, static_cast<GLsizei>(g_gl.width), static_cast<GLsizei>(g_gl.height));
+                glDisable(GL_SCISSOR_TEST);
+                glDisable(GL_DEPTH_TEST);
+                glDisable(GL_CULL_FACE);
+                glDisable(GL_BLEND);
+
+                const auto p = make_depth_convert_params(g_gl.width, g_gl.height, cand.width, cand.height, mode, cfg, &cand.region);
+                const float uv_scale_x = cand.width ? (p.source_scale_x * static_cast<float>(g_gl.width) / static_cast<float>(cand.width)) : 1.0f;
+                const float uv_scale_y = cand.height ? (p.source_scale_y * static_cast<float>(g_gl.height) / static_cast<float>(cand.height)) : 1.0f;
+                const float uv_off_x = cand.width ? (p.source_left / static_cast<float>(cand.width)) : 0.0f;
+                const float uv_off_y = cand.height ? (p.source_top / static_cast<float>(cand.height)) : 0.0f;
+
+                g_gl_fn.UseProgram(dp.prog);
+                g_gl_fn.Uniform1i(dp.depth_tex, 0);
+                g_gl_fn.Uniform1i(dp.mode, static_cast<GLint>(mode));
+                g_gl_fn.Uniform1i(dp.linearize, static_cast<GLint>(p.linearize));
+                g_gl_fn.Uniform1i(dp.reversed_z, static_cast<GLint>(p.reversed_z));
+                g_gl_fn.Uniform1f(dp.z_near, p.z_near);
+                g_gl_fn.Uniform1f(dp.z_far, p.z_far);
+                g_gl_fn.Uniform2f(dp.source_scale, uv_scale_x, uv_scale_y);
+                g_gl_fn.Uniform2f(dp.source_offset, uv_off_x, uv_off_y);
+
+                g_gl_fn.BindVertexArray(g_gl.dummy_vao);
+                glDrawArrays(GL_TRIANGLES, 0, 3);
+
+                if (!multisampled) {
+                    glTexParameteri(GL_TEXTURE_2D, kGL_TEXTURE_COMPARE_MODE, prev_cmp);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, prev_min);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, prev_mag);
+
+                }
+                ensure_depth_pbo(write_slot, depth_bpp);
+                g_gl_fn.BindFramebuffer(kGL_READ_FRAMEBUFFER, g_gl.depth_conv_fbo);
+                glReadBuffer(kGL_COLOR_ATTACHMENT0);
+                glPixelStorei(GL_PACK_ALIGNMENT, 1);
+                glPixelStorei(0x0D02, 0);
+                glPixelStorei(0x0D03, 0);
+                glPixelStorei(0x0D04, 0);
+                g_gl_fn.BindBuffer(kGL_PIXEL_PACK_BUFFER, g_gl.depth_pbo[write_slot]);
+                glReadPixels(0, 0, static_cast<GLsizei>(g_gl.width), static_cast<GLsizei>(g_gl.height),
+                             (depth_bpp == 1) ? kGL_RED : GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                g_gl_fn.BindBuffer(kGL_PIXEL_PACK_BUFFER, 0);
+                captured_depth = true;
+            }
+        }
     }
 
+    if (want_depth && !captured_depth) return;
+    const bool capture_color = !preview_only || (cfg->preview_pair_generation != generation);
     if (capture_color) {
         GLboolean dbl = GL_FALSE;
         glGetBooleanv(GL_DOUBLEBUFFER, &dbl);
@@ -657,83 +840,15 @@ void capture_frame(SharedConfig* cfg, int64_t now_qpc, bool capture_color) {
         g_gl_fn.BindBuffer(kGL_PIXEL_PACK_BUFFER, 0);
     }
 
-    const bool want_depth = (cfg && cfg->depth_enabled != 0);
-    const uint32_t mode = cfg ? static_cast<uint32_t>(cfg->depth_mode) : static_cast<uint32_t>(DepthMode::Rgb24Lossless);
-    bool captured_depth = false;
-
-    DepthCandidate cand{};
-    const bool has_cand = select_depth_candidate(g_gl.heuristic.ranked_candidates(), cfg, g_gl.selected_depth_idx, cand);
-
-    if (want_depth && has_cand && g_gl.depth_prog && g_gl.depth_conv_fbo) {
-        GLuint depth_tex = 0;
-        if (g_gl.clear_snap_valid_this_frame && g_gl.clear_snap_key == cand.key && g_gl.clear_snap_tex) {
-            depth_tex = g_gl.clear_snap_tex;
-        } else if (cand.key == kDefaultFboDepthKey) {
-            g_gl_fn.BindFramebuffer(kGL_READ_FRAMEBUFFER, 0);
-            glBindTexture(GL_TEXTURE_2D, g_gl.default_depth_tex);
-            glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
-                                static_cast<GLsizei>(g_gl.width), static_cast<GLsizei>(g_gl.height));
-            depth_tex = g_gl.default_depth_tex;
-        } else {
-            depth_tex = static_cast<GLuint>(cand.key);
-        }
-
-        if (depth_tex != 0) {
-            const uint32_t bpp = (mode == static_cast<uint32_t>(DepthMode::Gray8)) ? 1 : 4;
-            const GLuint out_tex = (bpp == 1) ? g_gl.out_gray_tex : g_gl.out_rgba_tex;
-
-            g_gl_fn.BindFramebuffer(kGL_DRAW_FRAMEBUFFER, g_gl.depth_conv_fbo);
-            g_gl_fn.FramebufferTexture2D(kGL_DRAW_FRAMEBUFFER, kGL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, out_tex, 0);
-            if (g_gl_fn.CheckFramebufferStatus(kGL_DRAW_FRAMEBUFFER) == kGL_FRAMEBUFFER_COMPLETE) {
-                g_gl_fn.ActiveTexture(kGL_TEXTURE0);
-                glBindTexture(GL_TEXTURE_2D, depth_tex);
-                GLint prev_cmp = GL_NONE, prev_min = GL_NEAREST, prev_mag = GL_NEAREST;
-                glGetTexParameteriv(GL_TEXTURE_2D, kGL_TEXTURE_COMPARE_MODE, &prev_cmp);
-                glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, &prev_min);
-                glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, &prev_mag);
-                glTexParameteri(GL_TEXTURE_2D, kGL_TEXTURE_COMPARE_MODE, GL_NONE);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-
-                glViewport(0, 0, static_cast<GLsizei>(g_gl.width), static_cast<GLsizei>(g_gl.height));
-                glDisable(GL_SCISSOR_TEST);
-                glDisable(GL_DEPTH_TEST);
-                glDisable(GL_CULL_FACE);
-                glDisable(GL_BLEND);
-
-                g_gl_fn.UseProgram(g_gl.depth_prog);
-                g_gl_fn.Uniform1i(g_gl.loc_depth_tex, 0);
-                g_gl_fn.Uniform1i(g_gl.loc_mode, static_cast<GLint>(mode));
-                g_gl_fn.Uniform1i(g_gl.loc_linearize, cfg ? static_cast<GLint>(cfg->linearize) : 1);
-                g_gl_fn.Uniform1i(g_gl.loc_reversed_z, cfg ? static_cast<GLint>(cfg->reversed_z) : 1);
-                g_gl_fn.Uniform1f(g_gl.loc_z_near, cfg ? cfg->z_near : 0.1f);
-                g_gl_fn.Uniform1f(g_gl.loc_z_far, cfg ? cfg->z_far : 500.0f);
-
-                g_gl_fn.BindVertexArray(g_gl.dummy_vao);
-                glDrawArrays(GL_TRIANGLES, 0, 3);
-
-                glTexParameteri(GL_TEXTURE_2D, kGL_TEXTURE_COMPARE_MODE, prev_cmp);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, prev_min);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, prev_mag);
-
-                ensure_depth_pbo(write_slot, bpp);
-                g_gl_fn.BindFramebuffer(kGL_READ_FRAMEBUFFER, g_gl.depth_conv_fbo);
-                glReadBuffer(kGL_COLOR_ATTACHMENT0);
-                glPixelStorei(GL_PACK_ALIGNMENT, 1);
-                g_gl_fn.BindBuffer(kGL_PIXEL_PACK_BUFFER, g_gl.depth_pbo[write_slot]);
-                glReadPixels(0, 0, static_cast<GLsizei>(g_gl.width), static_cast<GLsizei>(g_gl.height),
-                             (bpp == 1) ? kGL_RED : GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-                g_gl_fn.BindBuffer(kGL_PIXEL_PACK_BUFFER, 0);
-                captured_depth = true;
-            }
-        }
+    if (g_gl.slot_fence[write_slot]) {
+        g_gl_fn.DeleteSync(g_gl.slot_fence[write_slot]);
+        g_gl.slot_fence[write_slot] = nullptr;
     }
-
-    g_gl.slot_qpc[write_slot] = now_qpc;
-    g_gl.slot_mode[write_slot] = mode;
-    g_gl.slot_has_depth[write_slot] = captured_depth;
-    g_gl.slot_has_color[write_slot] = capture_color;
-    g_gl.slot_pending[write_slot] = true;
+    g_gl.slot_fence[write_slot] = g_gl_fn.FenceSync(0x9117 /* GL_SYNC_GPU_COMMANDS_COMPLETE */, 0);
+    if (g_gl.slot_fence[write_slot]) {
+        g_gl.slots.mark_queued(write_slot, now_qpc, generation, preview_only, mode,
+                               capture_color, captured_depth, depth_bpp, false);
+    }
 }
 
 void record_active_draw() {
@@ -741,11 +856,13 @@ void record_active_draw() {
     std::lock_guard lock(g_mutex);
     if (g_gl.current_draw_fbo == 0) {
         g_gl.heuristic.record_draw(kDefaultFboDepthKey, g_gl.width, g_gl.height, g_gl.width, g_gl.height);
+        g_gl.heuristic.set_region(kDefaultFboDepthKey, g_gl.render_region);
     } else {
         auto it = g_gl.fbo_depths.find(g_gl.current_draw_fbo);
         if (it != g_gl.fbo_depths.end() && it->second.tex != 0) {
-            g_gl.heuristic.record_draw(static_cast<uintptr_t>(it->second.tex),
-                                       it->second.width, it->second.height, g_gl.width, g_gl.height);
+            const uintptr_t key = static_cast<uintptr_t>(it->second.tex);
+            g_gl.heuristic.record_draw(key, it->second.width, it->second.height, g_gl.width, g_gl.height);
+            g_gl.heuristic.set_region(key, g_gl.render_region);
         }
     }
 }
@@ -755,6 +872,7 @@ BOOL WINAPI hkWglSwapBuffers(HDC hdc) {
     {
         std::lock_guard lock(g_mutex);
         if (!g_config_view.get()) g_config_view.open_or_create(false);
+        const LONG generation = g_config_view.get() ? g_config_view.get()->capture_generation : -1;
         HWND hwnd = WindowFromDC(hdc);
         RECT rc{};
         const uint32_t w = (hwnd && GetClientRect(hwnd, &rc)) ? static_cast<uint32_t>(rc.right - rc.left) : 0;
@@ -768,18 +886,29 @@ BOOL WINAPI hkWglSwapBuffers(HDC hdc) {
             const double fps = tick_fps_and_telemetry(cfg, 2, g_gl.last_qpc, g_gl.qpc_freq,
                                                       g_gl.last_cycle_seq, g_gl.selected_depth_idx, now_qpc);
 
-            const bool is_recording = (cfg && cfg->recording != 0 && g_ipc_ring.event_handle() != nullptr);
-            const bool is_preview = (!is_recording && cfg && cfg->preview_enabled != 0 && g_ipc_ring.event_handle() != nullptr &&
+            const bool ipc_active = (cfg && (cfg->recording != 0 || cfg->preview_enabled != 0) && g_ipc_ring.event_handle() != nullptr);
+            if (ipc_active) {
+                flush_pending_slots(cfg, generation);
+            } else {
+                g_gl.slots.reset_all();
+            }
+            if (cfg && g_gl.last_capture_generation != cfg->capture_generation) {
+                g_gl.last_capture_generation = cfg->capture_generation;
+                g_gl.last_cap_qpc = 0;
+            }
+            const bool is_recording = (ipc_active && cfg->recording != 0 &&
+                                       should_capture_recording_now(now_qpc, g_gl.qpc_freq,
+                                                                    static_cast<uint32_t>(cfg->target_rec_fps), g_gl.last_cap_qpc));
+            const bool is_preview = (ipc_active && cfg->recording == 0 && cfg->preview_enabled != 0 &&
                                      should_capture_preview_now(now_qpc, g_gl.qpc_freq, g_gl.last_preview_qpc));
             if (is_recording || is_preview) {
-                capture_frame(cfg, now_qpc, is_recording);
-            } else if (!cfg || (cfg->recording == 0 && cfg->preview_enabled == 0)) {
-                for (bool& p : g_gl.slot_pending) p = false;
+                capture_frame(cfg, now_qpc, is_preview, generation);
             }
 
             if (cfg && cfg->overlay_enabled != 0) {
                 const double rec_fps = static_cast<double>(cfg->actual_rec_fps_x10) / 10.0;
-                draw_fps_overlay(fps, rec_fps, cfg->recording != 0, static_cast<OverlayCorner>(cfg->overlay_corner));
+                draw_fps_overlay(fps, rec_fps, cfg->recording != 0, recording_activity(cfg), now_qpc, g_gl.qpc_freq,
+                                 static_cast<OverlayCorner>(cfg->overlay_corner));
             }
 
             g_gl.frame_idx++;
@@ -807,16 +936,27 @@ void APIENTRY hkGlFramebufferTexture2D(GLenum target, GLenum attachment, GLenum 
         if (texture == 0) {
             g_gl.fbo_depths.erase(g_gl.current_draw_fbo);
         } else {
-            GLint tw = 0, th = 0;
-            GLint prev_tex = 0;
-            glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
-            glBindTexture(GL_TEXTURE_2D, texture);
-            glGetTexLevelParameteriv(GL_TEXTURE_2D, level, kGL_TEXTURE_WIDTH, &tw);
-            glGetTexLevelParameteriv(GL_TEXTURE_2D, level, kGL_TEXTURE_HEIGHT, &th);
-            glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(prev_tex));
-            g_gl.fbo_depths[g_gl.current_draw_fbo] = {texture, static_cast<uint32_t>(tw), static_cast<uint32_t>(th)};
+            const bool msaa = (textarget == kGL_TEXTURE_2D_MULTISAMPLE);
+            const GLenum bind_target = msaa ? kGL_TEXTURE_2D_MULTISAMPLE : GL_TEXTURE_2D;
+            const GLenum binding_enum = msaa ? 0x9104 /* GL_TEXTURE_BINDING_2D_MULTISAMPLE */ : GL_TEXTURE_BINDING_2D;
+            GLint tw = 0, th = 0, prev_tex = 0;
+            glGetIntegerv(binding_enum, &prev_tex);
+            glBindTexture(bind_target, texture);
+            glGetTexLevelParameteriv(bind_target, level, kGL_TEXTURE_WIDTH, &tw);
+            glGetTexLevelParameteriv(bind_target, level, kGL_TEXTURE_HEIGHT, &th);
+            glBindTexture(bind_target, static_cast<GLuint>(prev_tex));
+            g_gl.fbo_depths[g_gl.current_draw_fbo] = {texture, static_cast<uint32_t>(tw), static_cast<uint32_t>(th), msaa};
         }
     }
+}
+
+void APIENTRY hkGlViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
+    {
+        std::lock_guard lock(g_mutex);
+        g_gl.render_region = {static_cast<float>(x), static_cast<float>(y),
+                              static_cast<float>(width), static_cast<float>(height)};
+    }
+    oGlViewport(x, y, width, height);
 }
 
 void APIENTRY hkGlClear(GLbitfield mask) {
@@ -925,6 +1065,7 @@ bool install_gl_hooks() {
     hook_export("wglSwapBuffers", reinterpret_cast<void*>(&hkWglSwapBuffers), reinterpret_cast<void**>(&oWglSwapBuffers));
     hook_export("wglGetProcAddress", reinterpret_cast<void*>(&hkWglGetProcAddress), reinterpret_cast<void**>(&oWglGetProcAddress));
     hook_export("glClear", reinterpret_cast<void*>(&hkGlClear), reinterpret_cast<void**>(&oGlClear));
+    hook_export("glViewport", reinterpret_cast<void*>(&hkGlViewport), reinterpret_cast<void**>(&oGlViewport));
     hook_export("glDrawArrays", reinterpret_cast<void*>(&hkGlDrawArrays), reinterpret_cast<void**>(&oGlDrawArrays));
     hook_export("glDrawElements", reinterpret_cast<void*>(&hkGlDrawElements), reinterpret_cast<void**>(&oGlDrawElements));
     hook_export("glEnd", reinterpret_cast<void*>(&hkGlEnd), reinterpret_cast<void**>(&oGlEnd));
@@ -940,7 +1081,8 @@ void remove_gl_hooks() {
     if (g_gl_fn.loaded && wglGetCurrentContext()) {
         if (g_gl.depth_conv_fbo) g_gl_fn.DeleteFramebuffers(1, &g_gl.depth_conv_fbo);
         if (g_gl.dummy_vao) g_gl_fn.DeleteVertexArrays(1, &g_gl.dummy_vao);
-        if (g_gl.depth_prog) g_gl_fn.DeleteProgram(g_gl.depth_prog);
+        if (g_gl.depth_2d.prog) g_gl_fn.DeleteProgram(g_gl.depth_2d.prog);
+        if (g_gl.depth_msaa.prog) g_gl_fn.DeleteProgram(g_gl.depth_msaa.prog);
         if (g_gl.overlay_prog) g_gl_fn.DeleteProgram(g_gl.overlay_prog);
         if (g_gl.font_tex) glDeleteTextures(1, &g_gl.font_tex);
     }

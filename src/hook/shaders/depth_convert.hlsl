@@ -1,4 +1,8 @@
+#if DEPTH_MSAA
+Texture2DMS<float> DepthTex : register(t0);
+#else
 Texture2D<float> DepthTex : register(t0);
+#endif
 RWTexture2D<unorm float> OutGray : register(u0);
 RWTexture2D<unorm float4> OutRgba : register(u1);
 
@@ -11,6 +15,8 @@ cbuffer Params : register(b0) {
     float g_z_near;
     float g_z_far;
     float g_pad;
+    float2 g_source_scale;
+    float2 g_source_offset;
 };
 
 float LinearizeDepth(float d) {
@@ -26,7 +32,14 @@ float LinearizeDepth(float d) {
 void CSMain(uint3 dtid : SV_DispatchThreadID) {
     if (dtid.x >= g_width || dtid.y >= g_height) return;
 
-    float d_raw = saturate(DepthTex.Load(int3(dtid.xy, 0)));
+    // Map pixel centers onto the depth texture, including reduced render resolutions.
+    const int2 source = int2((float2(dtid.xy) + 0.5f) * g_source_scale + g_source_offset);
+#if DEPTH_MSAA
+    // Preserve a real depth sample at geometry edges instead of blending surfaces.
+    float d_raw = saturate(DepthTex.Load(source, 0));
+#else
+    float d_raw = saturate(DepthTex.Load(int3(source, 0)));
+#endif
 
     if (g_mode == 0) {
         float d = (g_linearize != 0) ? LinearizeDepth(d_raw) : d_raw;

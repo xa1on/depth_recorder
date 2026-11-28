@@ -28,16 +28,27 @@ int wmain(int argc, wchar_t** argv) {
             GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW"));
         HANDLE thread = CreateRemoteThread(proc, nullptr, 0, load_lib, remote_mem, 0, nullptr);
         if (thread) {
-            WaitForSingleObject(thread, 5000);
-            DWORD ret = 0;
-            if (GetExitCodeThread(thread, &ret) && ret == 0) rc = ERROR_MOD_NOT_FOUND;
+            const DWORD wait = WaitForSingleObject(thread, 5000);
+            if (wait == WAIT_OBJECT_0) {
+                DWORD module = 0;
+                if (!GetExitCodeThread(thread, &module)) {
+                    rc = static_cast<int>(GetLastError());
+                } else if (module == 0) {
+                    rc = ERROR_MOD_NOT_FOUND;
+                }
+            } else {
+                rc = wait == WAIT_TIMEOUT ? ERROR_TIMEOUT : static_cast<int>(GetLastError());
+                // The target thread may still read the path. Leave it allocated
+                // in the target process, which will reclaim it on exit.
+                remote_mem = nullptr;
+            }
             CloseHandle(thread);
         } else {
             rc = static_cast<int>(GetLastError());
         }
     }
 
-    VirtualFreeEx(proc, remote_mem, 0, MEM_RELEASE);
+    if (remote_mem) VirtualFreeEx(proc, remote_mem, 0, MEM_RELEASE);
     CloseHandle(proc);
     return rc;
 }

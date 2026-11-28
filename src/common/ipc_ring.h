@@ -19,13 +19,15 @@ struct FrameHeader {
     int64_t  qpc_freq;
     uint32_t width;
     uint32_t height;
-    uint32_t color_bytes;   // BGRA8 or RGBA8: width * height * 4 (0 if is_preview_only)
+    uint32_t color_bytes;   // BGRA8 or RGBA8: width * height * 4 (0 for depth-only preview)
     uint32_t depth_bytes;   // 0 if !has_depth; width * height * (1 or 4)
     uint32_t depth_mode;    // DepthMode
     uint32_t has_depth;
     uint8_t  color_is_rgba; // 1 = RGBA8, 0 = BGRA8
-    uint8_t  is_preview_only; // 1 = idle depth-only preview frame
+    uint8_t  is_preview_only; // 1 = idle preview or readiness check
     uint8_t  reserved[2]{};
+    LONG capture_generation;
+    uint32_t producer_pid;
 };
 
 struct RingControlBlock {
@@ -37,15 +39,20 @@ struct RingControlBlock {
     std::atomic<uint64_t> read_idx;
 };
 
+static_assert(sizeof(FrameHeader) == 64);
+static_assert(std::atomic<uint64_t>::is_always_lock_free);
+
 class IpcRing {
 public:
     ~IpcRing() { close(); }
 
     bool open_or_create(bool create_new) {
-        const DWORD size_hi = static_cast<DWORD>(kRingTotalBytes >> 32);
+        const DWORD size_hi = static_cast<DWORD>(static_cast<uint64_t>(kRingTotalBytes) >> 32);
         const DWORD size_lo = static_cast<DWORD>(kRingTotalBytes & 0xFFFFFFFFULL);
+        bool existed = false;
         if (create_new) {
             mapping_ = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, size_hi, size_lo, kRingMappingName);
+            existed = GetLastError() == ERROR_ALREADY_EXISTS;
             event_ = CreateEventW(nullptr, FALSE, FALSE, kFrameEventName);
         } else {
             mapping_ = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, kRingMappingName);
@@ -55,7 +62,6 @@ public:
             close();
             return false;
         }
-        const bool existed = (GetLastError() == ERROR_ALREADY_EXISTS);
         base_ = static_cast<uint8_t*>(MapViewOfFile(mapping_, FILE_MAP_ALL_ACCESS, 0, 0, kRingTotalBytes));
         if (!base_) {
             close();
@@ -69,6 +75,11 @@ public:
             ctrl_->write_idx.store(0, std::memory_order_relaxed);
             ctrl_->read_idx.store(0, std::memory_order_relaxed);
         }
+        if (ctrl_->magic != 0x44524E47 || ctrl_->slot_count != kRingSlots ||
+            ctrl_->slot_payload_bytes != kMaxSlotPayloadBytes) {
+            close();
+            return false;
+        }
         return true;
     }
 
@@ -78,22 +89,33 @@ public:
         if (event_) { CloseHandle(event_); event_ = nullptr; }
     }
 
-    bool try_push(const FrameHeader& hdr, const void* color_data, const void* depth_data) {
-        if (!ctrl_) return false;
-        const size_t total = sizeof(FrameHeader) + hdr.color_bytes + hdr.depth_bytes;
-        if (total > kMaxSlotPayloadBytes) return false;
+    // Reserve next slot directly so caller can write payload into shared memory without an extra copy.
+    uint8_t* begin_push(uint32_t payload_bytes) {
+        if (!ctrl_) return nullptr;
+        const size_t total = sizeof(FrameHeader) + static_cast<size_t>(payload_bytes);
+        if (total > kMaxSlotPayloadBytes) return nullptr;
 
         const uint64_t w = ctrl_->write_idx.load(std::memory_order_relaxed);
         const uint64_t r = ctrl_->read_idx.load(std::memory_order_acquire);
-        if (w - r >= kRingSlots) return false; // ring full
+        if (w - r >= kRingSlots) return nullptr; // ring full
 
-        uint8_t* dst = slot_ptr(w % kRingSlots);
-        std::memcpy(dst, &hdr, sizeof(FrameHeader));
-        if (hdr.color_bytes && color_data) std::memcpy(dst + sizeof(FrameHeader), color_data, hdr.color_bytes);
-        if (hdr.depth_bytes && depth_data) std::memcpy(dst + sizeof(FrameHeader) + hdr.color_bytes, depth_data, hdr.depth_bytes);
+        return slot_ptr(w % kRingSlots) + sizeof(FrameHeader);
+    }
 
+    void commit_push(const FrameHeader& hdr) {
+        if (!ctrl_) return;
+        const uint64_t w = ctrl_->write_idx.load(std::memory_order_relaxed);
+        std::memcpy(slot_ptr(w % kRingSlots), &hdr, sizeof(FrameHeader));
         ctrl_->write_idx.store(w + 1, std::memory_order_release);
         SetEvent(event_);
+    }
+
+    bool try_push(const FrameHeader& hdr, const void* color_data, const void* depth_data) {
+        uint8_t* dst_payload = begin_push(hdr.color_bytes + hdr.depth_bytes);
+        if (!dst_payload) return false;
+        if (hdr.color_bytes && color_data) std::memcpy(dst_payload, color_data, hdr.color_bytes);
+        if (hdr.depth_bytes && depth_data) std::memcpy(dst_payload + hdr.color_bytes, depth_data, hdr.depth_bytes);
+        commit_push(hdr);
         return true;
     }
 

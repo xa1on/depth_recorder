@@ -4,6 +4,7 @@
 #include <psapi.h>
 #include <tlhelp32.h>
 #include <unordered_map>
+#include <cwchar>
 
 namespace dr {
 
@@ -113,6 +114,26 @@ std::vector<ProcessEntry> list_processes() {
     return list;
 }
 
+bool process_has_vulkan_without_layer(DWORD pid) {
+    HANDLE proc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    if (!proc) return false;
+    HMODULE mods[512]{};
+    DWORD needed = 0;
+    bool has_vk = false, has_layer = false;
+    if (EnumProcessModulesEx(proc, mods, sizeof(mods), &needed, LIST_MODULES_ALL)) {
+        const DWORD count = std::min<DWORD>(needed / sizeof(HMODULE), 512);
+        wchar_t mod_name[MAX_PATH]{};
+        for (DWORD i = 0; i < count; ++i) {
+            if (GetModuleBaseNameW(proc, mods[i], mod_name, MAX_PATH)) {
+                if (_wcsicmp(mod_name, L"vulkan-1.dll") == 0) has_vk = true;
+                else if (_wcsicmp(mod_name, L"VkLayer_depth_recorder.dll") == 0) has_layer = true;
+            }
+        }
+    }
+    CloseHandle(proc);
+    return has_vk && !has_layer;
+}
+
 bool inject_dll(DWORD pid, const std::wstring& dll_path, std::wstring* out_error) {
     HANDLE proc = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
                               PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
@@ -129,7 +150,7 @@ bool inject_dll(DWORD pid, const std::wstring& dll_path, std::wstring* out_error
         const auto inj32 = dir / L"inject32.exe";
         const auto dll32 = dir / L"depth_hook32.dll";
         if (!std::filesystem::exists(inj32) || !std::filesystem::exists(dll32)) {
-            if (out_error) *out_error = L"32-bit target requires inject32.exe and depth_hook32.dll next to depth_recorder.exe.";
+            if (out_error) *out_error = L"This package supports 64-bit targets. A build with 32-bit capture support is needed for this process.";
             return false;
         }
         std::wstring cmd = L"\"" + inj32.wstring() + L"\" " + std::to_wstring(pid) + L" \"" + dll32.wstring() + L"\"";
@@ -164,11 +185,22 @@ bool inject_dll(DWORD pid, const std::wstring& dll_path, std::wstring* out_error
             GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW"));
         HANDLE thread = CreateRemoteThread(proc, nullptr, 0, load_lib, remote_mem, 0, nullptr);
         if (thread) {
-            WaitForSingleObject(thread, 5000);
-            DWORD remote_ret = 0;
-            if (GetExitCodeThread(thread, &remote_ret) && remote_ret == 0) {
+            const DWORD wait = WaitForSingleObject(thread, 5000);
+            if (wait != WAIT_OBJECT_0) {
+                const DWORD error = wait == WAIT_TIMEOUT ? ERROR_TIMEOUT : GetLastError();
                 ok = false;
-                if (out_error) *out_error = L"LoadLibraryW returned NULL inside target process (architecture mismatch or blocked DLL).";
+                // The loader thread may still be reading the remote path.
+                remote_mem = nullptr;
+                if (out_error) *out_error = format_win32_error(L"Waiting for the capture DLL to load", error);
+            } else {
+                DWORD remote_ret = 0;
+                if (!GetExitCodeThread(thread, &remote_ret)) {
+                    ok = false;
+                    if (out_error) *out_error = format_win32_error(L"GetExitCodeThread", GetLastError());
+                } else if (remote_ret == 0) {
+                    ok = false;
+                    if (out_error) *out_error = L"LoadLibraryW returned NULL inside target process (architecture mismatch or blocked DLL).";
+                }
             }
             CloseHandle(thread);
         } else {
@@ -177,24 +209,74 @@ bool inject_dll(DWORD pid, const std::wstring& dll_path, std::wstring* out_error
         }
     }
 
-    VirtualFreeEx(proc, remote_mem, 0, MEM_RELEASE);
+    if (remote_mem) VirtualFreeEx(proc, remote_mem, 0, MEM_RELEASE);
     CloseHandle(proc);
     return ok;
 }
 
 bool launch_and_inject(const std::wstring& exe_path, const std::wstring& dll_path, DWORD& out_pid, std::wstring* out_error) {
     const std::wstring dir = std::filesystem::path(exe_path).parent_path().wstring();
-    const std::wstring layer_dir = std::filesystem::path(dll_path).parent_path().wstring();
+    const auto recorder_dir = std::filesystem::path(dll_path).parent_path();
+    DWORD binary_type = SCS_64BIT_BINARY;
+    GetBinaryTypeW(exe_path.c_str(), &binary_type);
+    if (binary_type == SCS_32BIT_BINARY &&
+        (!std::filesystem::exists(recorder_dir / L"inject32.exe") ||
+         !std::filesystem::exists(recorder_dir / L"depth_hook32.dll"))) {
+        if (out_error) *out_error = L"This package supports 64-bit targets. A build with 32-bit capture support is needed for this process.";
+        return false;
+    }
+    const auto layer_dir = recorder_dir / (binary_type == SCS_32BIT_BINARY ? L"vulkan/x86" : L"vulkan/x64");
+    auto layer_manifest = layer_dir / L"VkLayer_depth_recorder.json";
+    if (!std::filesystem::exists(layer_manifest)) layer_manifest = recorder_dir / layer_manifest.filename();
+    const bool add_capture_layer = std::filesystem::exists(layer_manifest);
 
-    // Portable Vulkan layer env vars for child process (zero registry mutation)
-    SetEnvironmentVariableW(L"VK_ADD_LAYER_PATH", layer_dir.c_str());
-    SetEnvironmentVariableW(L"VK_INSTANCE_LAYERS", L"VK_LAYER_DEPTH_RECORDER");
+    // Add the bundled explicit layer for this child only.
+    std::vector<std::wstring> entries;
+    std::wstring layers = L"VK_LAYER_DEPTH_RECORDER";
+    // A manifest path lets the Windows loader skip directory enumeration, which can fail for Unicode paths.
+    std::wstring layer_paths = layer_manifest.wstring();
+    std::wstring override_paths;
+    if (const auto env = GetEnvironmentStringsW()) {
+        for (const wchar_t* entry = env; *entry; entry += std::wcslen(entry) + 1) {
+            std::wstring value(entry);
+            const auto separator = value.find(L'=', 1);
+            if (add_capture_layer && separator != std::wstring::npos) {
+                const auto key = value.substr(0, separator);
+                if (_wcsicmp(key.c_str(), L"VK_INSTANCE_LAYERS") == 0) {
+                    layers += L";" + value.substr(separator + 1);
+                    continue;
+                }
+                if (_wcsicmp(key.c_str(), L"VK_ADD_LAYER_PATH") == 0) {
+                    layer_paths += L";" + value.substr(separator + 1);
+                    continue;
+                }
+                if (_wcsicmp(key.c_str(), L"VK_LAYER_PATH") == 0) {
+                    override_paths = value.substr(separator + 1);
+                    continue;
+                }
+            }
+            entries.push_back(std::move(value));
+        }
+        FreeEnvironmentStringsW(env);
+    }
+    if (add_capture_layer) {
+        entries.push_back(L"VK_INSTANCE_LAYERS=" + layers);
+        const bool override_set = !override_paths.empty();
+        entries.push_back((override_set ? L"VK_LAYER_PATH=" : L"VK_ADD_LAYER_PATH=") +
+                          layer_paths + (override_set ? L";" + override_paths : L""));
+    }
+    std::sort(entries.begin(), entries.end(), [](const auto& left, const auto& right) {
+        return _wcsicmp(left.c_str(), right.c_str()) < 0;
+    });
+    std::vector<wchar_t> environment;
+    for (const auto& entry : entries) environment.insert(environment.end(), entry.c_str(), entry.c_str() + entry.size() + 1);
+    environment.push_back(L'\0');
 
     STARTUPINFOW si{sizeof(si)};
     PROCESS_INFORMATION pi{};
     std::wstring cmd = L"\"" + exe_path + L"\"";
     if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE,
-                        0, nullptr, dir.empty() ? nullptr : dir.c_str(), &si, &pi)) {
+                        CREATE_UNICODE_ENVIRONMENT, environment.data(), dir.empty() ? nullptr : dir.c_str(), &si, &pi)) {
         if (out_error) *out_error = format_win32_error(L"CreateProcessW", GetLastError());
         return false;
     }

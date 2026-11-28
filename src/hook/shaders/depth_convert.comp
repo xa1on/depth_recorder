@@ -2,7 +2,11 @@
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
+#ifdef DEPTH_MSAA
+layout(binding = 0) uniform sampler2DMS uDepthTex;
+#else
 layout(binding = 0) uniform sampler2D uDepthTex;
+#endif
 layout(binding = 1, r8) uniform writeonly image2D uOutGray;
 layout(binding = 2, rgba8) uniform writeonly image2D uOutRgba;
 
@@ -15,6 +19,8 @@ layout(push_constant) uniform Params {
     float z_near;
     float z_far;
     float pad;
+    vec2 source_scale;
+    vec2 source_offset;
 } pc;
 
 float linearize_depth(float d) {
@@ -36,7 +42,12 @@ void main() {
         return;
     }
 
-    float d_raw = clamp(texelFetch(uDepthTex, gid, 0).r, 0.0, 1.0);
+    ivec2 src = ivec2((vec2(gid) + 0.5) * pc.source_scale + pc.source_offset);
+#ifdef DEPTH_MSAA
+    float d_raw = clamp(texelFetch(uDepthTex, src, 0).r, 0.0, 1.0);
+#else
+    float d_raw = clamp(texelFetch(uDepthTex, src, 0).r, 0.0, 1.0);
+#endif
 
     if (pc.mode == 0u) {
         float d = (pc.linearize != 0u) ? linearize_depth(d_raw) : d_raw;

@@ -6,13 +6,19 @@
 
 namespace dr {
 
+struct DepthRegion {
+    float left = 0, top = 0, width = 0, height = 0;
+};
+
 struct DepthCandidate {
-    uintptr_t key = 0;
+    uint64_t key = 0;
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t draw_calls = 0;
+    uint32_t prev_draw_calls = 0;
     uint32_t clears = 0;
     uint64_t last_frame = 0;
+    DepthRegion region;
 };
 
 class DepthHeuristic {
@@ -20,23 +26,32 @@ public:
     void begin_frame(uint64_t frame_idx) {
         current_frame_ = frame_idx;
         for (auto& c : candidates_) {
+            if (c.draw_calls > 0) c.prev_draw_calls = c.draw_calls;
             c.draw_calls = 0;
             c.clears = 0;
         }
     }
 
-    void record_draw(uintptr_t key, uint32_t w, uint32_t h, uint32_t swap_w, uint32_t swap_h) {
+    void record_draw(uint64_t key, uint32_t w, uint32_t h, uint32_t swap_w, uint32_t swap_h) {
         if (!key || !is_plausible_size(w, h, swap_w, swap_h)) return;
         auto& c = get_or_add(key, w, h);
         c.draw_calls++;
         c.last_frame = current_frame_;
     }
 
-    void record_clear(uintptr_t key, uint32_t w, uint32_t h, uint32_t swap_w, uint32_t swap_h) {
+    void record_clear(uint64_t key, uint32_t w, uint32_t h, uint32_t swap_w, uint32_t swap_h) {
         if (!key || !is_plausible_size(w, h, swap_w, swap_h)) return;
         auto& c = get_or_add(key, w, h);
         c.clears++;
         c.last_frame = current_frame_;
+    }
+
+    void set_region(uint64_t key, DepthRegion region) {
+        for (auto& c : candidates_) {
+            if (c.key != key) continue;
+            c.region = region;
+            break;
+        }
     }
 
     // Prune stale candidates not seen for > 120 frames
@@ -55,6 +70,15 @@ public:
                 out.push_back(c);
             }
         }
+        if (out.empty()) {
+            for (const auto& c : candidates_) {
+                if (current_frame_ <= c.last_frame + 3 && c.prev_draw_calls > 0) {
+                    DepthCandidate copy = c;
+                    copy.draw_calls = c.prev_draw_calls;
+                    out.push_back(copy);
+                }
+            }
+        }
         std::sort(out.begin(), out.end(), [](const DepthCandidate& a, const DepthCandidate& b) {
             if (a.draw_calls != b.draw_calls) return a.draw_calls > b.draw_calls;
             return (a.width * a.height) > (b.width * b.height);
@@ -71,7 +95,7 @@ public:
     }
 
 private:
-    DepthCandidate& get_or_add(uintptr_t key, uint32_t w, uint32_t h) {
+    DepthCandidate& get_or_add(uint64_t key, uint32_t w, uint32_t h) {
         for (auto& c : candidates_) {
             if (c.key == key) {
                 c.width = w;
@@ -79,7 +103,7 @@ private:
                 return c;
             }
         }
-        candidates_.push_back({key, w, h, 0, 0, current_frame_});
+        candidates_.push_back({key, w, h, 0, 0, 0, current_frame_});
         return candidates_.back();
     }
 

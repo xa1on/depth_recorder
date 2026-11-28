@@ -3,9 +3,10 @@
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_layer.h>
 
-#include "hook_common.h"
+#include "slot_ring.h"
 #include "fps_overlay_font.h"
 #include "depth_convert_spv.h"
+#include "depth_convert_msaa_spv.h"
 
 #include <windows.h>
 #include <algorithm>
@@ -14,6 +15,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -22,6 +24,8 @@ namespace {
 dr::SharedConfigView g_config_view;
 dr::IpcRing g_ipc_ring;
 std::recursive_mutex g_mutex;
+LONG g_last_unload_seq = -1;
+ULONGLONG g_last_inst_check_ms = 0;
 
 constexpr uint32_t kStagingSlots = 3;
 
@@ -34,10 +38,26 @@ struct DepthConvertPC {
     float z_near;
     float z_far;
     float pad;
+    float source_scale_x;
+    float source_scale_y;
+    float source_offset_x;
+    float source_offset_y;
 };
 
 inline void* dispatch_key(const void* handle) {
     return *reinterpret_cast<void* const*>(handle);
+}
+
+template<typename Handle>
+uint64_t handle_id(Handle handle) {
+    if constexpr (std::is_pointer_v<Handle>) return reinterpret_cast<uintptr_t>(handle);
+    else return static_cast<uint64_t>(handle);
+}
+
+template<typename Handle>
+Handle handle_from_id(uint64_t id) {
+    if constexpr (std::is_pointer_v<Handle>) return reinterpret_cast<Handle>(static_cast<uintptr_t>(id));
+    else return static_cast<Handle>(id);
 }
 
 bool is_depth_format(VkFormat fmt) {
@@ -62,6 +82,9 @@ struct InstanceData {
     VkInstance instance = VK_NULL_HANDLE;
     PFN_vkGetInstanceProcAddr next_gipa = nullptr;
     PFN_vkDestroyInstance DestroyInstance = nullptr;
+    PFN_vkCreateWin32SurfaceKHR CreateWin32SurfaceKHR = nullptr;
+    PFN_vkDestroySurfaceKHR DestroySurfaceKHR = nullptr;
+    std::unordered_map<VkSurfaceKHR, HWND> windows;
     PFN_vkGetPhysicalDeviceMemoryProperties GetPhysicalDeviceMemoryProperties = nullptr;
     PFN_vkGetPhysicalDeviceQueueFamilyProperties GetPhysicalDeviceQueueFamilyProperties = nullptr;
 };
@@ -71,6 +94,7 @@ struct ImageInfo {
     uint32_t height = 0;
     VkFormat format = VK_FORMAT_UNDEFINED;
     bool is_depth = false;
+    VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
 };
 
 struct ImageViewInfo {
@@ -82,6 +106,13 @@ struct RenderPassInfo {
     int32_t depth_attachment_index = -1;
 };
 
+struct CmdDepthUse {
+    VkImage img = VK_NULL_HANDLE;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    dr::DepthRegion region{};
+};
+
 struct FramebufferInfo {
     std::vector<VkImageView> attachments;
 };
@@ -91,6 +122,8 @@ struct SwapchainInfo {
     uint32_t height = 0;
     VkFormat format = VK_FORMAT_UNDEFINED;
     std::vector<VkImage> images;
+    HWND window = nullptr;
+    std::vector<VkSemaphore> present_ready;
 };
 
 struct DeviceData {
@@ -124,11 +157,13 @@ struct DeviceData {
     PFN_vkEndCommandBuffer EndCommandBuffer = nullptr;
     PFN_vkResetCommandBuffer ResetCommandBuffer = nullptr;
     PFN_vkQueueSubmit QueueSubmit = nullptr;
+    PFN_vkQueueSubmit2 QueueSubmit2 = nullptr;
+    PFN_vkQueueSubmit2KHR QueueSubmit2KHR = nullptr;
     PFN_vkQueueWaitIdle QueueWaitIdle = nullptr;
     PFN_vkDeviceWaitIdle DeviceWaitIdle = nullptr;
     PFN_vkCreateFence CreateFence = nullptr;
     PFN_vkDestroyFence DestroyFence = nullptr;
-    PFN_vkWaitForFences WaitForFences = nullptr;
+    PFN_vkGetFenceStatus GetFenceStatus = nullptr;
     PFN_vkResetFences ResetFences = nullptr;
     PFN_vkCreateSemaphore CreateSemaphore = nullptr;
     PFN_vkDestroySemaphore DestroySemaphore = nullptr;
@@ -157,7 +192,10 @@ struct DeviceData {
     PFN_vkCmdBlitImage CmdBlitImage = nullptr;
     PFN_vkCmdClearAttachments CmdClearAttachments = nullptr;
     PFN_vkCmdClearDepthStencilImage CmdClearDepthStencilImage = nullptr;
+    PFN_vkCmdSetViewport CmdSetViewport = nullptr;
     PFN_vkCmdBeginRenderPass CmdBeginRenderPass = nullptr;
+    PFN_vkCmdBeginRenderPass2 CmdBeginRenderPass2 = nullptr;
+    PFN_vkCmdBeginRenderPass2KHR CmdBeginRenderPass2KHR = nullptr;
     PFN_vkCmdBeginRendering CmdBeginRendering = nullptr;
     PFN_vkCmdBeginRenderingKHR CmdBeginRenderingKHR = nullptr;
     PFN_vkCreateRenderPass CreateRenderPass = nullptr;
@@ -178,6 +216,8 @@ struct DeviceData {
     std::unordered_map<VkFramebuffer, FramebufferInfo> framebuffers;
     std::unordered_map<VkSwapchainKHR, SwapchainInfo> swapchains;
     std::unordered_map<VkCommandBuffer, VkImage> cmd_active_depth;
+    std::unordered_map<VkCommandBuffer, dr::DepthRegion> cmd_viewports;
+    std::unordered_map<VkCommandBuffer, std::vector<CmdDepthUse>> cmd_used_depths;
     std::unordered_map<VkQueue, uint32_t> queue_families;
     uint32_t default_queue_family = 0;
 
@@ -199,15 +239,18 @@ struct DeviceData {
     VkCommandPool cmd_pool = VK_NULL_HANDLE;
     VkCommandBuffer cmd_bufs[kStagingSlots]{};
     VkFence fences[kStagingSlots]{};
-    VkSemaphore overlay_sem = VK_NULL_HANDLE;
+    uint32_t capture_queue_family = UINT32_MAX;
+    VkQueue capture_queue = VK_NULL_HANDLE;
 
     VkSampler depth_sampler = VK_NULL_HANDLE;
     VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
     VkPipelineLayout pipe_layout = VK_NULL_HANDLE;
     VkShaderModule comp_shader = VK_NULL_HANDLE;
+    VkShaderModule comp_shader_msaa = VK_NULL_HANDLE;
     VkPipeline comp_pipeline = VK_NULL_HANDLE;
+    VkPipeline comp_pipeline_msaa = VK_NULL_HANDLE;
     VkDescriptorPool desc_pool = VK_NULL_HANDLE;
-    VkDescriptorSet desc_set = VK_NULL_HANDLE;
+    VkDescriptorSet desc_set[kStagingSlots]{};
 
     VkImage out_gray_img = VK_NULL_HANDLE;
     VkDeviceMemory out_gray_mem = VK_NULL_HANDLE;
@@ -227,14 +270,10 @@ struct DeviceData {
     VkDeviceMemory depth_mem[kStagingSlots]{};
     void* depth_mapped[kStagingSlots]{};
 
-    bool slot_pending[kStagingSlots]{};
-    bool slot_has_color[kStagingSlots]{};
-    int64_t slot_qpc[kStagingSlots]{};
-    uint32_t slot_mode[kStagingSlots]{};
-    bool slot_has_depth[kStagingSlots]{};
-    uint32_t slot_depth_bpp[kStagingSlots]{};
-    bool slot_is_rgba[kStagingSlots]{};
+    dr::CaptureSlotTracker<kStagingSlots> slots;
+    LONG last_capture_generation = -1;
     int64_t last_preview_qpc = 0;
+    int64_t last_cap_qpc = 0;
 
     // FPS overlay resources
     VkImage overlay_img = VK_NULL_HANDLE;
@@ -244,6 +283,8 @@ struct DeviceData {
     void* overlay_buf_mapped = nullptr;
     uint32_t overlay_w = 0;
     uint32_t overlay_h = 0;
+    dr::OverlayBitmapCache overlay_cache;
+    bool overlay_initialized = false;
 
     std::vector<uint8_t> color_pack_buf;
     std::vector<uint8_t> depth_pack_buf;
@@ -260,7 +301,7 @@ uint32_t find_memory_type(DeviceData* dev, uint32_t type_filter, VkMemoryPropert
             return i;
         }
     }
-    return 0;
+    return UINT32_MAX;
 }
 
 bool create_buffer_and_mem(DeviceData* dev, VkDeviceSize size, VkBufferUsageFlags usage,
@@ -274,9 +315,15 @@ bool create_buffer_and_mem(DeviceData* dev, VkDeviceSize size, VkBufferUsageFlag
     VkMemoryRequirements req{};
     dev->GetBufferMemoryRequirements(dev->device, out_buf, &req);
 
+    uint32_t mem_idx = find_memory_type(dev, req.memoryTypeBits, props);
+    if (mem_idx == UINT32_MAX && (props & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) {
+        mem_idx = find_memory_type(dev, req.memoryTypeBits, props & ~VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    }
+    if (mem_idx == UINT32_MAX) return false;
+
     VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     mai.allocationSize = req.size;
-    mai.memoryTypeIndex = find_memory_type(dev, req.memoryTypeBits, props);
+    mai.memoryTypeIndex = mem_idx;
     if (dev->AllocateMemory(dev->device, &mai, nullptr, &out_mem) != VK_SUCCESS) return false;
     if (dev->BindBufferMemory(dev->device, out_buf, out_mem, 0) != VK_SUCCESS) return false;
     if (out_mapped) {
@@ -327,8 +374,7 @@ void cmd_barrier(DeviceData* dev, VkCommandBuffer cmd, VkImage img, VkImageAspec
 }
 
 void release_size_dependent(DeviceData* dev) {
-    if (dev->DeviceWaitIdle) dev->DeviceWaitIdle(dev->device);
-
+    dev->slots.reset_all();
     for (uint32_t i = 0; i < kStagingSlots; ++i) {
         if (dev->color_mapped[i]) { dev->UnmapMemory(dev->device, dev->color_mem[i]); dev->color_mapped[i] = nullptr; }
         if (dev->color_buf[i]) { dev->DestroyBuffer(dev->device, dev->color_buf[i], nullptr); dev->color_buf[i] = VK_NULL_HANDLE; }
@@ -337,7 +383,6 @@ void release_size_dependent(DeviceData* dev) {
         if (dev->depth_mapped[i]) { dev->UnmapMemory(dev->device, dev->depth_mem[i]); dev->depth_mapped[i] = nullptr; }
         if (dev->depth_buf[i]) { dev->DestroyBuffer(dev->device, dev->depth_buf[i], nullptr); dev->depth_buf[i] = VK_NULL_HANDLE; }
         if (dev->depth_mem[i]) { dev->FreeMemory(dev->device, dev->depth_mem[i], nullptr); dev->depth_mem[i] = VK_NULL_HANDLE; }
-        dev->slot_pending[i] = false;
     }
 
     if (dev->out_gray_view) { dev->DestroyImageView(dev->device, dev->out_gray_view, nullptr); dev->out_gray_view = VK_NULL_HANDLE; }
@@ -353,6 +398,7 @@ void release_size_dependent(DeviceData* dev) {
 }
 
 void destroy_all_internal_resources(DeviceData* dev) {
+    dev->DeviceWaitIdle(dev->device);
     release_size_dependent(dev);
 
     for (auto& [img, view] : dev->depth_sample_views) {
@@ -368,12 +414,18 @@ void destroy_all_internal_resources(DeviceData* dev) {
 
     if (dev->desc_pool) { dev->DestroyDescriptorPool(dev->device, dev->desc_pool, nullptr); dev->desc_pool = VK_NULL_HANDLE; }
     if (dev->comp_pipeline) { dev->DestroyPipeline(dev->device, dev->comp_pipeline, nullptr); dev->comp_pipeline = VK_NULL_HANDLE; }
+    if (dev->comp_pipeline_msaa) { dev->DestroyPipeline(dev->device, dev->comp_pipeline_msaa, nullptr); dev->comp_pipeline_msaa = VK_NULL_HANDLE; }
     if (dev->comp_shader) { dev->DestroyShaderModule(dev->device, dev->comp_shader, nullptr); dev->comp_shader = VK_NULL_HANDLE; }
+    if (dev->comp_shader_msaa) { dev->DestroyShaderModule(dev->device, dev->comp_shader_msaa, nullptr); dev->comp_shader_msaa = VK_NULL_HANDLE; }
     if (dev->pipe_layout) { dev->DestroyPipelineLayout(dev->device, dev->pipe_layout, nullptr); dev->pipe_layout = VK_NULL_HANDLE; }
     if (dev->dsl) { dev->DestroyDescriptorSetLayout(dev->device, dev->dsl, nullptr); dev->dsl = VK_NULL_HANDLE; }
     if (dev->depth_sampler) { dev->DestroySampler(dev->device, dev->depth_sampler, nullptr); dev->depth_sampler = VK_NULL_HANDLE; }
 
-    if (dev->overlay_sem) { dev->DestroySemaphore(dev->device, dev->overlay_sem, nullptr); dev->overlay_sem = VK_NULL_HANDLE; }
+    for (const auto& [swapchain, info] : dev->swapchains) {
+        for (const auto semaphore : info.present_ready) {
+            if (semaphore) dev->DestroySemaphore(dev->device, semaphore, nullptr);
+        }
+    }
     for (uint32_t i = 0; i < kStagingSlots; ++i) {
         if (dev->fences[i]) { dev->DestroyFence(dev->device, dev->fences[i], nullptr); dev->fences[i] = VK_NULL_HANDLE; }
     }
@@ -383,6 +435,7 @@ void destroy_all_internal_resources(DeviceData* dev) {
 
 bool ensure_resources(DeviceData* dev, uint32_t w, uint32_t h, uint32_t queue_family) {
     if (w == 0 || h == 0) return false;
+    if (dev->res_initialized && dev->capture_queue_family != queue_family) return false;
 
     if (!dev->res_initialized) {
         LARGE_INTEGER freq{};
@@ -392,6 +445,7 @@ bool ensure_resources(DeviceData* dev, uint32_t w, uint32_t h, uint32_t queue_fa
         VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
         cpci.queueFamilyIndex = queue_family;
+        dev->capture_queue_family = queue_family;
         if (dev->CreateCommandPool(dev->device, &cpci, nullptr, &dev->cmd_pool) != VK_SUCCESS) return false;
 
         VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -401,12 +455,10 @@ bool ensure_resources(DeviceData* dev, uint32_t w, uint32_t h, uint32_t queue_fa
         if (dev->AllocateCommandBuffers(dev->device, &cbai, dev->cmd_bufs) != VK_SUCCESS) return false;
 
         VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
         for (uint32_t i = 0; i < kStagingSlots; ++i) {
             if (dev->CreateFence(dev->device, &fci, nullptr, &dev->fences[i]) != VK_SUCCESS) return false;
         }
-
-        VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-        if (dev->CreateSemaphore(dev->device, &sci, nullptr, &dev->overlay_sem) != VK_SUCCESS) return false;
 
         VkSamplerCreateInfo smci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
         smci.magFilter = VK_FILTER_NEAREST;
@@ -446,26 +498,39 @@ bool ensure_resources(DeviceData* dev, uint32_t w, uint32_t h, uint32_t queue_fa
         cpci_pipe.layout = dev->pipe_layout;
         if (dev->CreateComputePipelines(dev->device, VK_NULL_HANDLE, 1, &cpci_pipe, nullptr, &dev->comp_pipeline) != VK_SUCCESS) return false;
 
+        VkShaderModuleCreateInfo shci_msaa{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        shci_msaa.codeSize = sizeof(g_depth_convert_msaa_spv);
+        shci_msaa.pCode = g_depth_convert_msaa_spv;
+        if (dev->CreateShaderModule(dev->device, &shci_msaa, nullptr, &dev->comp_shader_msaa) == VK_SUCCESS) {
+            cpci_pipe.stage.module = dev->comp_shader_msaa;
+            dev->CreateComputePipelines(dev->device, VK_NULL_HANDLE, 1, &cpci_pipe, nullptr, &dev->comp_pipeline_msaa);
+        }
+
         VkDescriptorPoolSize pool_sizes[2] = {
-            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
-            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2},
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kStagingSlots},
+            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * kStagingSlots},
         };
         VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        dpci.maxSets = 1;
+        dpci.maxSets = kStagingSlots;
         dpci.poolSizeCount = 2;
         dpci.pPoolSizes = pool_sizes;
         if (dev->CreateDescriptorPool(dev->device, &dpci, nullptr, &dev->desc_pool) != VK_SUCCESS) return false;
 
         VkDescriptorSetAllocateInfo dsai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
         dsai.descriptorPool = dev->desc_pool;
-        dsai.descriptorSetCount = 1;
-        dsai.pSetLayouts = &dev->dsl;
-        if (dev->AllocateDescriptorSets(dev->device, &dsai, &dev->desc_set) != VK_SUCCESS) return false;
+        VkDescriptorSetLayout layouts[kStagingSlots];
+        std::fill_n(layouts, kStagingSlots, dev->dsl);
+        dsai.descriptorSetCount = kStagingSlots;
+        dsai.pSetLayouts = layouts;
+        if (dev->AllocateDescriptorSets(dev->device, &dsai, dev->desc_set) != VK_SUCCESS) return false;
 
         dev->res_initialized = true;
     }
 
     if (dev->res_w != w || dev->res_h != h) {
+        for (const auto fence : dev->fences) {
+            if (dev->GetFenceStatus(dev->device, fence) != VK_SUCCESS) return false;
+        }
         release_size_dependent(dev);
         dev->res_w = w;
         dev->res_h = h;
@@ -488,7 +553,8 @@ bool ensure_resources(DeviceData* dev, uint32_t w, uint32_t h, uint32_t queue_fa
         dev->CreateImageView(dev->device, &ivci, nullptr, &dev->out_rgba_view);
 
         const VkDeviceSize frame_bytes = static_cast<VkDeviceSize>(w) * h * 4;
-        const VkMemoryPropertyFlags host_props = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        const VkMemoryPropertyFlags host_props =
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
         for (uint32_t i = 0; i < kStagingSlots; ++i) {
             if (!create_buffer_and_mem(dev, frame_bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, host_props,
                                        dev->color_buf[i], dev->color_mem[i], &dev->color_mapped[i])) return false;
@@ -500,7 +566,8 @@ bool ensure_resources(DeviceData* dev, uint32_t w, uint32_t h, uint32_t queue_fa
 }
 
 bool ensure_overlay_image(DeviceData* dev, uint32_t bw, uint32_t bh) {
-    if (dev->overlay_img && dev->overlay_w == bw && dev->overlay_h == bh) return true;
+    if (dev->overlay_img && dev->overlay_buf_mapped && dev->overlay_w == bw && dev->overlay_h == bh) return true;
+    dev->overlay_initialized = false;
     if (dev->overlay_buf_mapped) { dev->UnmapMemory(dev->device, dev->overlay_buf_mem); dev->overlay_buf_mapped = nullptr; }
     if (dev->overlay_buf) { dev->DestroyBuffer(dev->device, dev->overlay_buf, nullptr); dev->overlay_buf = VK_NULL_HANDLE; }
     if (dev->overlay_buf_mem) { dev->FreeMemory(dev->device, dev->overlay_buf_mem, nullptr); dev->overlay_buf_mem = VK_NULL_HANDLE; }
@@ -551,7 +618,7 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_vkCreateImage(
 
     VkImageCreateInfo mod{};
     bool is_depth = false;
-    if (pCreateInfo && is_depth_format(pCreateInfo->format) && pCreateInfo->samples == VK_SAMPLE_COUNT_1_BIT) {
+    if (pCreateInfo && is_depth_format(pCreateInfo->format)) {
         mod = *pCreateInfo;
         mod.usage |= VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         pCreateInfo = &mod;
@@ -561,7 +628,8 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_vkCreateImage(
     const VkResult res = dev->CreateImage(device, pCreateInfo, pAllocator, pImage);
     if (res == VK_SUCCESS && pImage && *pImage && pCreateInfo) {
         std::lock_guard lock(g_mutex);
-        dev->images[*pImage] = {pCreateInfo->extent.width, pCreateInfo->extent.height, pCreateInfo->format, is_depth};
+        dev->images[*pImage] = {pCreateInfo->extent.width, pCreateInfo->extent.height,
+                                pCreateInfo->format, is_depth, pCreateInfo->samples};
     }
     return res;
 }
@@ -765,9 +833,16 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_vkCreateSwapchainKHR(
         if (count > 0) dev->GetSwapchainImagesKHR(device, *pSwapchain, &count, imgs.data());
 
         std::lock_guard lock(g_mutex);
-        dev->swap_w = pCreateInfo->imageExtent.width;
-        dev->swap_h = pCreateInfo->imageExtent.height;
-        dev->swapchains[*pSwapchain] = {pCreateInfo->imageExtent.width, pCreateInfo->imageExtent.height, pCreateInfo->imageFormat, std::move(imgs)};
+        const uint64_t new_area = static_cast<uint64_t>(pCreateInfo->imageExtent.width) * pCreateInfo->imageExtent.height;
+        const uint64_t cur_area = static_cast<uint64_t>(dev->swap_w) * dev->swap_h;
+        if (dev->swap_w == 0 || new_area >= cur_area) {
+            dev->swap_w = pCreateInfo->imageExtent.width;
+            dev->swap_h = pCreateInfo->imageExtent.height;
+        }
+        HWND window = nullptr;
+        if (auto it = dev->inst->windows.find(pCreateInfo->surface); it != dev->inst->windows.end()) window = it->second;
+        dev->swapchains[*pSwapchain] = {pCreateInfo->imageExtent.width, pCreateInfo->imageExtent.height,
+                                       pCreateInfo->imageFormat, std::move(imgs), window, std::vector<VkSemaphore>(count)};
     }
     return res;
 }
@@ -780,7 +855,16 @@ VKAPI_ATTR void VKAPI_CALL hook_vkDestroySwapchainKHR(
         auto it = g_devices.find(dispatch_key(device));
         if (it != g_devices.end()) {
             dev = it->second.get();
-            dev->swapchains.erase(swapchain);
+            if (auto swap = dev->swapchains.find(swapchain); swap != dev->swapchains.end()) {
+                if (std::any_of(swap->second.present_ready.begin(), swap->second.present_ready.end(),
+                                [](VkSemaphore semaphore) { return semaphore != VK_NULL_HANDLE; })) {
+                    dev->DeviceWaitIdle(device);
+                    for (const auto semaphore : swap->second.present_ready) {
+                        if (semaphore) dev->DestroySemaphore(device, semaphore, nullptr);
+                    }
+                }
+                dev->swapchains.erase(swap);
+            }
         }
     }
     if (dev && dev->DestroySwapchainKHR) dev->DestroySwapchainKHR(device, swapchain, pAllocator);
@@ -803,6 +887,152 @@ VKAPI_ATTR void VKAPI_CALL hook_vkGetDeviceQueue(
     }
 }
 
+static void record_cmd_depth_use(DeviceData* dev, VkCommandBuffer cmd, VkImage depth_img, uint32_t w, uint32_t h) {
+    const uint64_t key = handle_id(depth_img);
+    dev->heuristic.record_draw(key, w, h, dev->swap_w, dev->swap_h);
+    dr::DepthRegion region{};
+    auto vpit = dev->cmd_viewports.find(cmd);
+    if (vpit != dev->cmd_viewports.end()) {
+        region = vpit->second;
+        dev->heuristic.set_region(key, region);
+    }
+    dev->cmd_active_depth[cmd] = depth_img;
+    dev->cmd_used_depths[cmd].push_back({depth_img, w, h, region});
+}
+
+static void track_render_pass_depth(DeviceData* dev, VkCommandBuffer cmd, const VkRenderPassBeginInfo* info) {
+    dev->cmd_active_depth.erase(cmd);
+    if (!info || dev->swap_w == 0) return;
+    auto rpit = dev->render_passes.find(info->renderPass);
+    if (rpit == dev->render_passes.end()) return;
+    const int32_t d_idx = rpit->second.depth_attachment_index;
+    if (d_idx < 0) return;
+
+    VkImageView depth_view = VK_NULL_HANDLE;
+    for (const auto* next = static_cast<const VkBaseInStructure*>(info->pNext); next; next = next->pNext) {
+        if (next->sType == VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO) {
+            const auto* abi = reinterpret_cast<const VkRenderPassAttachmentBeginInfo*>(next);
+            if (abi->pAttachments && static_cast<uint32_t>(d_idx) < abi->attachmentCount) {
+                depth_view = abi->pAttachments[d_idx];
+            }
+            break;
+        }
+    }
+    if (depth_view == VK_NULL_HANDLE) {
+        auto fbit = dev->framebuffers.find(info->framebuffer);
+        if (fbit == dev->framebuffers.end() || static_cast<size_t>(d_idx) >= fbit->second.attachments.size()) return;
+        depth_view = fbit->second.attachments[d_idx];
+    }
+
+    auto ivit = dev->image_views.find(depth_view);
+    if (ivit == dev->image_views.end()) return;
+    VkImage depth_img = ivit->second.image;
+    auto iit = dev->images.find(depth_img);
+    if (iit != dev->images.end() && iit->second.is_depth) {
+        record_cmd_depth_use(dev, cmd, depth_img, iit->second.width, iit->second.height);
+    }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL hook_vkBeginCommandBuffer(
+    VkCommandBuffer commandBuffer, const VkCommandBufferBeginInfo* pBeginInfo) {
+    DeviceData* dev = nullptr;
+    {
+        std::lock_guard lock(g_mutex);
+        auto it = g_devices.find(dispatch_key(commandBuffer));
+        if (it != g_devices.end()) {
+            dev = it->second.get();
+            dev->cmd_active_depth.erase(commandBuffer);
+            dev->cmd_viewports.erase(commandBuffer);
+            dev->cmd_used_depths.erase(commandBuffer);
+        }
+    }
+    return (dev && dev->BeginCommandBuffer) ? dev->BeginCommandBuffer(commandBuffer, pBeginInfo) : VK_ERROR_INITIALIZATION_FAILED;
+}
+
+VKAPI_ATTR void VKAPI_CALL hook_vkFreeCommandBuffers(
+    VkDevice device, VkCommandPool commandPool, uint32_t commandBufferCount, const VkCommandBuffer* pCommandBuffers) {
+    DeviceData* dev = nullptr;
+    {
+        std::lock_guard lock(g_mutex);
+        auto it = g_devices.find(dispatch_key(device));
+        if (it != g_devices.end()) {
+            dev = it->second.get();
+            for (uint32_t i = 0; i < commandBufferCount && pCommandBuffers; ++i) {
+                dev->cmd_active_depth.erase(pCommandBuffers[i]);
+                dev->cmd_viewports.erase(pCommandBuffers[i]);
+                dev->cmd_used_depths.erase(pCommandBuffers[i]);
+            }
+        }
+    }
+    if (dev && dev->FreeCommandBuffers) dev->FreeCommandBuffers(device, commandPool, commandBufferCount, pCommandBuffers);
+}
+
+static void replay_cmd_depth_uses(DeviceData* dev, VkCommandBuffer cmd) {
+    if (dev->swap_w == 0) return;
+    auto it = dev->cmd_used_depths.find(cmd);
+    if (it == dev->cmd_used_depths.end()) return;
+    for (const auto& u : it->second) {
+        if (dev->images.find(u.img) == dev->images.end()) continue;
+        const uint64_t key = handle_id(u.img);
+        dev->heuristic.record_draw(key, u.width, u.height, dev->swap_w, dev->swap_h);
+        if (u.region.width > 0 && u.region.height > 0) dev->heuristic.set_region(key, u.region);
+    }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL hook_vkQueueSubmit(
+    VkQueue queue, uint32_t submitCount, const VkSubmitInfo* pSubmits, VkFence fence) {
+    DeviceData* dev = nullptr;
+    {
+        std::lock_guard lock(g_mutex);
+        auto it = g_devices.find(dispatch_key(queue));
+        if (it != g_devices.end()) {
+            dev = it->second.get();
+            for (uint32_t i = 0; i < submitCount && pSubmits; ++i) {
+                for (uint32_t j = 0; j < pSubmits[i].commandBufferCount && pSubmits[i].pCommandBuffers; ++j) {
+                    replay_cmd_depth_uses(dev, pSubmits[i].pCommandBuffers[j]);
+                }
+            }
+        }
+    }
+    return (dev && dev->QueueSubmit) ? dev->QueueSubmit(queue, submitCount, pSubmits, fence) : VK_ERROR_INITIALIZATION_FAILED;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL hook_vkQueueSubmit2(
+    VkQueue queue, uint32_t submitCount, const VkSubmitInfo2* pSubmits, VkFence fence) {
+    DeviceData* dev = nullptr;
+    {
+        std::lock_guard lock(g_mutex);
+        auto it = g_devices.find(dispatch_key(queue));
+        if (it != g_devices.end()) {
+            dev = it->second.get();
+            for (uint32_t i = 0; i < submitCount && pSubmits; ++i) {
+                for (uint32_t j = 0; j < pSubmits[i].commandBufferInfoCount && pSubmits[i].pCommandBufferInfos; ++j) {
+                    replay_cmd_depth_uses(dev, pSubmits[i].pCommandBufferInfos[j].commandBuffer);
+                }
+            }
+        }
+    }
+    return (dev && dev->QueueSubmit2) ? dev->QueueSubmit2(queue, submitCount, pSubmits, fence) : VK_ERROR_INITIALIZATION_FAILED;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL hook_vkQueueSubmit2KHR(
+    VkQueue queue, uint32_t submitCount, const VkSubmitInfo2* pSubmits, VkFence fence) {
+    DeviceData* dev = nullptr;
+    {
+        std::lock_guard lock(g_mutex);
+        auto it = g_devices.find(dispatch_key(queue));
+        if (it != g_devices.end()) {
+            dev = it->second.get();
+            for (uint32_t i = 0; i < submitCount && pSubmits; ++i) {
+                for (uint32_t j = 0; j < pSubmits[i].commandBufferInfoCount && pSubmits[i].pCommandBufferInfos; ++j) {
+                    replay_cmd_depth_uses(dev, pSubmits[i].pCommandBufferInfos[j].commandBuffer);
+                }
+            }
+        }
+    }
+    return (dev && dev->QueueSubmit2KHR) ? dev->QueueSubmit2KHR(queue, submitCount, pSubmits, fence) : VK_ERROR_INITIALIZATION_FAILED;
+}
+
 VKAPI_ATTR void VKAPI_CALL hook_vkCmdBeginRenderPass(
     VkCommandBuffer commandBuffer, const VkRenderPassBeginInfo* pRenderPassBegin, VkSubpassContents contents) {
     DeviceData* dev = nullptr;
@@ -811,31 +1041,38 @@ VKAPI_ATTR void VKAPI_CALL hook_vkCmdBeginRenderPass(
         auto it = g_devices.find(dispatch_key(commandBuffer));
         if (it != g_devices.end()) {
             dev = it->second.get();
-            dev->cmd_active_depth.erase(commandBuffer);
-            if (pRenderPassBegin && dev->swap_w > 0) {
-                auto rpit = dev->render_passes.find(pRenderPassBegin->renderPass);
-                auto fbit = dev->framebuffers.find(pRenderPassBegin->framebuffer);
-                if (rpit != dev->render_passes.end() && fbit != dev->framebuffers.end()) {
-                    const int32_t d_idx = rpit->second.depth_attachment_index;
-                    if (d_idx >= 0 && static_cast<size_t>(d_idx) < fbit->second.attachments.size()) {
-                        VkImageView iv = fbit->second.attachments[d_idx];
-                        auto ivit = dev->image_views.find(iv);
-                        if (ivit != dev->image_views.end()) {
-                            VkImage depth_img = ivit->second.image;
-                            auto iit = dev->images.find(depth_img);
-                            if (iit != dev->images.end() && iit->second.is_depth) {
-                                dev->heuristic.record_draw(reinterpret_cast<uintptr_t>(depth_img),
-                                                           iit->second.width, iit->second.height,
-                                                           dev->swap_w, dev->swap_h);
-                                dev->cmd_active_depth[commandBuffer] = depth_img;
-                            }
-                        }
-                    }
-                }
-            }
+            track_render_pass_depth(dev, commandBuffer, pRenderPassBegin);
         }
     }
     if (dev && dev->CmdBeginRenderPass) dev->CmdBeginRenderPass(commandBuffer, pRenderPassBegin, contents);
+}
+
+VKAPI_ATTR void VKAPI_CALL hook_vkCmdBeginRenderPass2(
+    VkCommandBuffer commandBuffer, const VkRenderPassBeginInfo* pRenderPassBegin, const VkSubpassBeginInfo* pSubpassBeginInfo) {
+    DeviceData* dev = nullptr;
+    {
+        std::lock_guard lock(g_mutex);
+        auto it = g_devices.find(dispatch_key(commandBuffer));
+        if (it != g_devices.end()) {
+            dev = it->second.get();
+            track_render_pass_depth(dev, commandBuffer, pRenderPassBegin);
+        }
+    }
+    if (dev && dev->CmdBeginRenderPass2) dev->CmdBeginRenderPass2(commandBuffer, pRenderPassBegin, pSubpassBeginInfo);
+}
+
+VKAPI_ATTR void VKAPI_CALL hook_vkCmdBeginRenderPass2KHR(
+    VkCommandBuffer commandBuffer, const VkRenderPassBeginInfo* pRenderPassBegin, const VkSubpassBeginInfo* pSubpassBeginInfo) {
+    DeviceData* dev = nullptr;
+    {
+        std::lock_guard lock(g_mutex);
+        auto it = g_devices.find(dispatch_key(commandBuffer));
+        if (it != g_devices.end()) {
+            dev = it->second.get();
+            track_render_pass_depth(dev, commandBuffer, pRenderPassBegin);
+        }
+    }
+    if (dev && dev->CmdBeginRenderPass2KHR) dev->CmdBeginRenderPass2KHR(commandBuffer, pRenderPassBegin, pSubpassBeginInfo);
 }
 
 static void track_dynamic_rendering_depth(DeviceData* dev, VkCommandBuffer cmd, const VkRenderingInfo* info) {
@@ -846,11 +1083,30 @@ static void track_dynamic_rendering_depth(DeviceData* dev, VkCommandBuffer cmd, 
     VkImage depth_img = ivit->second.image;
     auto iit = dev->images.find(depth_img);
     if (iit != dev->images.end() && iit->second.is_depth) {
-        dev->heuristic.record_draw(reinterpret_cast<uintptr_t>(depth_img),
-                                   iit->second.width, iit->second.height,
-                                   dev->swap_w, dev->swap_h);
-        dev->cmd_active_depth[cmd] = depth_img;
+        record_cmd_depth_use(dev, cmd, depth_img, iit->second.width, iit->second.height);
     }
+}
+
+VKAPI_ATTR void VKAPI_CALL hook_vkCmdSetViewport(
+    VkCommandBuffer commandBuffer, uint32_t firstViewport, uint32_t viewportCount, const VkViewport* pViewports) {
+    DeviceData* dev = nullptr;
+    {
+        std::lock_guard lock(g_mutex);
+        auto it = g_devices.find(dispatch_key(commandBuffer));
+        if (it != g_devices.end()) {
+            dev = it->second.get();
+            if (firstViewport == 0 && viewportCount >= 1 && pViewports) {
+                const dr::DepthRegion region{pViewports[0].x, pViewports[0].y,
+                                             pViewports[0].width, pViewports[0].height};
+                dev->cmd_viewports[commandBuffer] = region;
+                auto dit = dev->cmd_active_depth.find(commandBuffer);
+                if (dit != dev->cmd_active_depth.end()) {
+                    dev->heuristic.set_region(handle_id(dit->second), region);
+                }
+            }
+        }
+    }
+    if (dev && dev->CmdSetViewport) dev->CmdSetViewport(commandBuffer, firstViewport, viewportCount, pViewports);
 }
 
 VKAPI_ATTR void VKAPI_CALL hook_vkCmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo* pRenderingInfo) {
@@ -900,7 +1156,7 @@ VKAPI_ATTR void VKAPI_CALL hook_vkCmdClearAttachments(
                 if (dit != dev->cmd_active_depth.end()) {
                     auto iit = dev->images.find(dit->second);
                     if (iit != dev->images.end()) {
-                        dev->heuristic.record_clear(reinterpret_cast<uintptr_t>(dit->second),
+                        dev->heuristic.record_clear(handle_id(dit->second),
                                                     iit->second.width, iit->second.height,
                                                     dev->swap_w, dev->swap_h);
                     }
@@ -930,74 +1186,137 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_vkQueuePresentKHR(VkQueue queue, const VkPre
 
     {
         std::lock_guard lock(g_mutex);
-        const VkSwapchainKHR sc = pPresentInfo->pSwapchains[0];
-        const uint32_t img_idx = pPresentInfo->pImageIndices[0];
-        auto scit = dev->swapchains.find(sc);
+        dr::ensure_ipc_connected(g_config_view, g_ipc_ring);
+        dr::SharedConfig* cfg = g_config_view.get();
+        if (cfg) {
+            bool stale = false;
+            if (g_last_unload_seq < 0) {
+                g_last_unload_seq = cfg->unload_seq;
+            } else if (cfg->unload_seq != g_last_unload_seq) {
+                stale = true;
+            } else {
+                const ULONGLONG now_ms = GetTickCount64();
+                if (now_ms - g_last_inst_check_ms >= 500) {
+                    g_last_inst_check_ms = now_ms;
+                    if (HANDLE inst_m = OpenMutexW(SYNCHRONIZE, FALSE, LR"(Local\DepthRecorderInstance)")) {
+                        CloseHandle(inst_m);
+                    } else {
+                        stale = true;
+                    }
+                }
+            }
+            if (stale) {
+                g_ipc_ring.close();
+                g_config_view.close();
+                g_last_unload_seq = -1;
+                cfg = nullptr;
+            }
+        }
+        const LONG generation = cfg ? cfg->capture_generation : -1;
+        auto scit = dev->swapchains.end();
+        uint32_t img_idx = 0;
+        for (uint32_t i = 0; i < pPresentInfo->swapchainCount; ++i) {
+            const auto swapchain = pPresentInfo->pSwapchains[i];
+            const auto target = dev->swapchains.find(swapchain);
+            if (target == dev->swapchains.end()) continue;
+            const auto& info = target->second;
+            if (dr::register_and_is_selected_swapchain(cfg, handle_id(swapchain), info.width, info.height, info.window)) {
+                scit = target;
+                img_idx = pPresentInfo->pImageIndices[i];
+            }
+        }
         if (scit != dev->swapchains.end() && img_idx < scit->second.images.size()) {
-            const SwapchainInfo& sci = scit->second;
+            SwapchainInfo& sci = scit->second;
             const uint32_t w = sci.width;
             const uint32_t h = sci.height;
+            dev->swap_w = w;
+            dev->swap_h = h;
             const VkImage swap_img = sci.images[img_idx];
             uint32_t q_fam = dev->default_queue_family;
             if (auto qfit = dev->queue_families.find(queue); qfit != dev->queue_families.end()) {
                 q_fam = qfit->second;
             }
 
-            if (ensure_resources(dev, w, h, q_fam)) {
-                dr::ensure_ipc_connected(g_config_view, g_ipc_ring);
-                dr::SharedConfig* cfg = g_config_view.get();
+            const bool color_supported = is_rgba_swapchain_format(sci.format) ||
+                sci.format == VK_FORMAT_B8G8R8A8_UNORM || sci.format == VK_FORMAT_B8G8R8A8_SRGB;
+            if (!color_supported) {
+                static VkFormat last_bad_fmt = VK_FORMAT_UNDEFINED;
+                if (last_bad_fmt != sci.format) {
+                    last_bad_fmt = sci.format;
+                    dr::log_push(cfg, "VK", "Unsupported swapchain format=%d (%ux%u)", static_cast<int>(sci.format), w, h);
+                }
+            } else if ((!dev->capture_queue || dev->capture_queue == queue) && !ensure_resources(dev, w, h, q_fam)) {
+                static bool logged_res_err = false;
+                if (!logged_res_err) {
+                    logged_res_err = true;
+                    dr::log_push(cfg, "VK", "ensure_resources failed (%ux%u qfam=%u)", w, h, q_fam);
+                }
+            }
+            if (color_supported && (!dev->capture_queue || dev->capture_queue == queue) && ensure_resources(dev, w, h, q_fam)) {
+                dev->capture_queue = queue;
+                if (dev->last_capture_generation != cfg->capture_generation) {
+                    dev->last_capture_generation = cfg->capture_generation;
+                    dev->last_cap_qpc = 0;
+                }
                 int64_t now_qpc = 0;
                 const double fps = dr::tick_fps_and_telemetry(cfg, 3, dev->last_qpc, dev->qpc_freq,
                                                               dev->last_cycle_seq, dev->selected_depth_idx, now_qpc);
 
-                const bool is_recording = (cfg && cfg->recording != 0 && g_ipc_ring.event_handle() != nullptr);
-                const bool is_preview = (!is_recording && cfg && cfg->preview_enabled != 0 && g_ipc_ring.event_handle() != nullptr &&
+                const bool ipc_active = (cfg && (cfg->recording != 0 || cfg->preview_enabled != 0) && g_ipc_ring.event_handle() != nullptr);
+                const bool is_recording = (ipc_active && cfg->recording != 0 &&
+                                           dr::should_capture_recording_now(now_qpc, dev->qpc_freq,
+                                                                            static_cast<uint32_t>(cfg->target_rec_fps), dev->last_cap_qpc));
+                const bool is_preview = (ipc_active && cfg->recording == 0 && cfg->preview_enabled != 0 &&
                                          dr::should_capture_preview_now(now_qpc, dev->qpc_freq, dev->last_preview_qpc));
                 const bool capture_now = is_recording || is_preview;
                 const bool overlay = (cfg && cfg->overlay_enabled != 0);
 
                 // 1. Drain completed readback slot(s)
-                const uint32_t write_slot = static_cast<uint32_t>(dev->frame_idx % kStagingSlots);
-                if (is_recording || (cfg && cfg->preview_enabled != 0 && g_ipc_ring.event_handle())) {
-                    for (uint32_t off = 1; off <= kStagingSlots; ++off) {
-                        const uint32_t read_slot = (write_slot + off) % kStagingSlots;
-                        if (!dev->slot_pending[read_slot]) continue;
-                        dev->WaitForFences(dev->device, 1, &dev->fences[read_slot], VK_TRUE, UINT64_MAX);
-
-                        uint32_t color_bytes = 0;
-                        bool is_rgba = false;
-                        if (dev->slot_has_color[read_slot]) {
-                            color_bytes = w * h * 4;
-                            dev->color_pack_buf.resize(color_bytes);
-                            std::memcpy(dev->color_pack_buf.data(), dev->color_mapped[read_slot], color_bytes);
-                            is_rgba = dev->slot_is_rgba[read_slot];
-                        }
-
-                        uint32_t depth_bytes = 0;
-                        if (dev->slot_has_depth[read_slot]) {
-                            depth_bytes = w * h * dev->slot_depth_bpp[read_slot];
-                            dev->depth_pack_buf.resize(depth_bytes);
-                            std::memcpy(dev->depth_pack_buf.data(), dev->depth_mapped[read_slot], depth_bytes);
-                        }
-
-                        dr::push_frame_to_ring(g_ipc_ring, cfg, dev->frame_idx, dev->slot_qpc[read_slot], dev->qpc_freq,
-                                               w, h, dev->slot_mode[read_slot], dev->slot_has_depth[read_slot],
-                                               color_bytes ? dev->color_pack_buf.data() : nullptr, color_bytes,
-                                               depth_bytes ? dev->depth_pack_buf.data() : nullptr, depth_bytes,
-                                               is_rgba, !dev->slot_has_color[read_slot]);
-                        dev->slot_pending[read_slot] = false;
+                if (ipc_active) {
+                    while (true) {
+                        const uint32_t read_slot = dev->slots.pick_oldest_pending(generation);
+                        if (read_slot >= kStagingSlots) break;
+                        if (dev->GetFenceStatus(dev->device, dev->fences[read_slot]) != VK_SUCCESS) break;
+                        const bool has_color = dev->slots.slots[read_slot].has_color;
+                        const bool has_depth = dev->slots.slots[read_slot].has_depth;
+                        const bool published = dev->slots.try_publish_slot(
+                            read_slot, g_ipc_ring, cfg, dev->frame_idx, dev->qpc_freq, w, h,
+                            [&](uint8_t* dst) -> bool {
+                                if (!has_color) return false;
+                                std::memcpy(dst, dev->color_mapped[read_slot], static_cast<size_t>(w) * h * 4);
+                                return true;
+                            },
+                            [&](uint8_t* dst) -> bool {
+                                if (!has_depth) return false;
+                                std::memcpy(dst, dev->depth_mapped[read_slot],
+                                            static_cast<size_t>(w) * h * dev->slots.slots[read_slot].depth_bpp);
+                                return true;
+                            });
+                        if (!published) break;
                     }
                 } else {
-                    for (bool& p : dev->slot_pending) p = false;
+                    dev->slots.reset_all();
                 }
 
                 // 2. Record current frame capture + overlay command buffer
-                if (capture_now || overlay) {
-                    if (dev->slot_pending[write_slot]) {
-                        dev->WaitForFences(dev->device, 1, &dev->fences[write_slot], VK_TRUE, UINT64_MAX);
-                        dev->slot_pending[write_slot] = false;
+                const uint32_t free_slot = dev->slots.acquire_free_slot();
+                const uint32_t write_slot = (free_slot < kStagingSlots)
+                    ? free_slot
+                    : static_cast<uint32_t>(dev->frame_idx % kStagingSlots);
+                VkSemaphore& present_ready = sci.present_ready[img_idx];
+                const bool fence_ready = dev->GetFenceStatus(dev->device, dev->fences[write_slot]) == VK_SUCCESS;
+                const bool can_capture = capture_now && free_slot < kStagingSlots && fence_ready;
+                const bool can_overlay = overlay && fence_ready;
+                const auto ranked = dev->heuristic.ranked_candidates();
+                dr::DepthCandidate cand{};
+                const bool has_cand = dr::select_depth_candidate(ranked, cfg, dev->selected_depth_idx, cand);
+                if (can_capture || can_overlay) {
+                    if (!present_ready) {
+                        VkSemaphoreCreateInfo create{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+                        dev->CreateSemaphore(dev->device, &create, nullptr, &present_ready);
                     }
-                    dev->ResetFences(dev->device, 1, &dev->fences[write_slot]);
+                }
+                if ((can_capture || can_overlay) && present_ready) {
 
                     VkCommandBuffer cmd = dev->cmd_bufs[write_slot];
                     dev->ResetCommandBuffer(cmd, 0);
@@ -1006,41 +1325,28 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_vkQueuePresentKHR(VkQueue queue, const VkPre
                     dev->BeginCommandBuffer(cmd, &cbbi);
 
                     VkImageLayout swap_layout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+                    bool queued_capture = false;
 
-                    if (capture_now) {
-                        if (is_recording) {
-                            cmd_barrier(dev, cmd, swap_img, VK_IMAGE_ASPECT_COLOR_BIT,
-                                        swap_layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                        VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-                                        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-                            swap_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-
-                            VkBufferImageCopy bic{};
-                            bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-                            bic.imageExtent = {w, h, 1};
-                            dev->CmdCopyImageToBuffer(cmd, swap_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dev->color_buf[write_slot], 1, &bic);
-                        }
-
+                    if (can_capture) {
                         const bool want_depth = (cfg->depth_enabled != 0);
                         const uint32_t mode = static_cast<uint32_t>(cfg->depth_mode);
                         bool captured_depth = false;
 
-                        dr::DepthCandidate cand{};
-                        const bool has_cand = dr::select_depth_candidate(dev->heuristic.ranked_candidates(), cfg, dev->selected_depth_idx, cand);
-
                         if (want_depth && has_cand) {
-                            VkImage depth_img = reinterpret_cast<VkImage>(cand.key);
+                            VkImage depth_img = handle_from_id<VkImage>(cand.key);
                             auto iit = dev->images.find(depth_img);
                             if (iit != dev->images.end()) {
+                                const bool multisampled = (iit->second.samples > VK_SAMPLE_COUNT_1_BIT);
+                                VkPipeline comp_pipe = (multisampled && dev->comp_pipeline_msaa) ? dev->comp_pipeline_msaa : dev->comp_pipeline;
                                 VkImageView d_view = get_depth_sample_view(dev, depth_img, iit->second.format);
-                                if (d_view) {
+                                if (d_view && comp_pipe) {
                                     VkDescriptorImageInfo d_info{dev->depth_sampler, d_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
                                     VkDescriptorImageInfo g_info{VK_NULL_HANDLE, dev->out_gray_view, VK_IMAGE_LAYOUT_GENERAL};
                                     VkDescriptorImageInfo r_info{VK_NULL_HANDLE, dev->out_rgba_view, VK_IMAGE_LAYOUT_GENERAL};
                                     VkWriteDescriptorSet writes[3]{};
-                                    writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dev->desc_set, 0, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &d_info, nullptr, nullptr};
-                                    writes[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dev->desc_set, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &g_info, nullptr, nullptr};
-                                    writes[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dev->desc_set, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &r_info, nullptr, nullptr};
+                                    writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dev->desc_set[write_slot], 0, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &d_info, nullptr, nullptr};
+                                    writes[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dev->desc_set[write_slot], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &g_info, nullptr, nullptr};
+                                    writes[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dev->desc_set[write_slot], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &r_info, nullptr, nullptr};
                                     dev->UpdateDescriptorSets(dev->device, 3, writes, 0, nullptr);
 
                                     const bool is_gray = (mode == static_cast<uint32_t>(dr::DepthMode::Gray8));
@@ -1055,17 +1361,23 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_vkQueuePresentKHR(VkQueue queue, const VkPre
                                                 0, VK_ACCESS_SHADER_WRITE_BIT,
                                                 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
+                                    const auto p = dr::make_depth_convert_params(
+                                        w, h, iit->second.width, iit->second.height, mode, cfg, &cand.region);
                                     DepthConvertPC pc{};
-                                    pc.width = w;
-                                    pc.height = h;
-                                    pc.mode = mode;
-                                    pc.linearize = static_cast<uint32_t>(cfg->linearize);
-                                    pc.reversed_z = static_cast<uint32_t>(cfg->reversed_z);
-                                    pc.z_near = cfg->z_near;
-                                    pc.z_far = cfg->z_far;
+                                    pc.width = p.width;
+                                    pc.height = p.height;
+                                    pc.mode = p.mode;
+                                    pc.linearize = p.linearize;
+                                    pc.reversed_z = p.reversed_z;
+                                    pc.z_near = p.z_near;
+                                    pc.z_far = p.z_far;
+                                    pc.source_scale_x = p.source_scale_x;
+                                    pc.source_scale_y = p.source_scale_y;
+                                    pc.source_offset_x = p.source_left;
+                                    pc.source_offset_y = p.source_top;
 
-                                    dev->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dev->comp_pipeline);
-                                    dev->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dev->pipe_layout, 0, 1, &dev->desc_set, 0, nullptr);
+                                    dev->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, comp_pipe);
+                                    dev->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dev->pipe_layout, 0, 1, &dev->desc_set[write_slot], 0, nullptr);
                                     dev->CmdPushConstants(cmd, dev->pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
                                     dev->CmdDispatch(cmd, (w + 15) / 16, (h + 15) / 16, 1);
 
@@ -1087,39 +1399,77 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_vkQueuePresentKHR(VkQueue queue, const VkPre
                             }
                         }
 
-                        dev->slot_qpc[write_slot] = now_qpc;
-                        dev->slot_mode[write_slot] = mode;
-                        dev->slot_has_depth[write_slot] = captured_depth;
-                        dev->slot_depth_bpp[write_slot] = (mode == static_cast<uint32_t>(dr::DepthMode::Gray8)) ? 1u : 4u;
-                        dev->slot_is_rgba[write_slot] = is_rgba_swapchain_format(sci.format);
-                        dev->slot_has_color[write_slot] = is_recording;
-                        dev->slot_pending[write_slot] = true;
+                        if (want_depth && has_cand && !captured_depth) {
+                            static bool logged_cap_fail = false;
+                            if (!logged_cap_fail) {
+                                logged_cap_fail = true;
+                                VkImage depth_img = handle_from_id<VkImage>(cand.key);
+                                auto iit = dev->images.find(depth_img);
+                                dr::log_push(cfg, "VK", "Depth capture skipped (in_images=%d w=%u h=%u)",
+                                             iit != dev->images.end() ? 1 : 0, cand.width, cand.height);
+                            }
+                        }
+                        if (!want_depth || captured_depth) {
+                            const bool capture_color = !is_preview || (cfg->preview_pair_generation != generation);
+                            if (capture_color) {
+                                cmd_barrier(dev, cmd, swap_img, VK_IMAGE_ASPECT_COLOR_BIT,
+                                            swap_layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                            VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                                            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                                swap_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+
+                                VkBufferImageCopy bic{};
+                                bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                                bic.imageExtent = {w, h, 1};
+                                dev->CmdCopyImageToBuffer(cmd, swap_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dev->color_buf[write_slot], 1, &bic);
+                            }
+
+                            const uint32_t depth_bpp = captured_depth
+                                ? ((mode == static_cast<uint32_t>(dr::DepthMode::Gray8)) ? 1u : 4u)
+                                : 0u;
+                            dev->slots.mark_queued(write_slot, now_qpc, generation, is_preview, mode, capture_color,
+                                                   captured_depth, depth_bpp, is_rgba_swapchain_format(sci.format));
+                            queued_capture = true;
+                        }
                     }
 
-                    if (overlay) {
-                        std::vector<uint8_t> rgba;
-                        uint32_t bw = 0, bh = 0;
-                        const double rec_fps = cfg ? (static_cast<double>(cfg->actual_rec_fps_x10) / 10.0) : 0.0;
-                        dr::render_fps_overlay_rgba(fps, rec_fps, cfg->recording != 0, rgba, bw, bh);
+                    bool overlay_uploaded = false;
+                    if (can_overlay) {
+                        const bool can_upload = std::all_of(std::begin(dev->fences), std::end(dev->fences), [&](VkFence fence) {
+                            return fence == dev->fences[write_slot] || dev->GetFenceStatus(dev->device, fence) == VK_SUCCESS;
+                        });
+                        if (can_upload) {
+                            const double rec_fps = cfg->actual_rec_fps_x10 / 10.0;
+                            const bool text_changed = dev->overlay_cache.update(
+                                fps, rec_fps, cfg->recording != 0, dr::recording_activity(cfg), now_qpc, dev->qpc_freq);
+                            const uint32_t bw = dev->overlay_cache.bw;
+                            const uint32_t bh = dev->overlay_cache.bh;
+                            const bool needs_upload = text_changed || !dev->overlay_initialized ||
+                                dev->overlay_w != bw || dev->overlay_h != bh;
+                            if (needs_upload && bw <= w && bh <= h && ensure_overlay_image(dev, bw, bh)) {
+                                std::memcpy(dev->overlay_buf_mapped, dev->overlay_cache.rgba.data(), dev->overlay_cache.rgba.size());
 
-                        if (bw <= w && bh <= h && ensure_overlay_image(dev, bw, bh)) {
-                            std::memcpy(dev->overlay_buf_mapped, rgba.data(), rgba.size());
+                                cmd_barrier(dev, cmd, dev->overlay_img, VK_IMAGE_ASPECT_COLOR_BIT,
+                                            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                            0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 
-                            cmd_barrier(dev, cmd, dev->overlay_img, VK_IMAGE_ASPECT_COLOR_BIT,
-                                        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                        0, VK_ACCESS_TRANSFER_WRITE_BIT,
-                                        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                                VkBufferImageCopy obic{};
+                                obic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                                obic.imageExtent = {bw, bh, 1};
+                                dev->CmdCopyBufferToImage(cmd, dev->overlay_buf, dev->overlay_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &obic);
 
-                            VkBufferImageCopy obic{};
-                            obic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-                            obic.imageExtent = {bw, bh, 1};
-                            dev->CmdCopyBufferToImage(cmd, dev->overlay_buf, dev->overlay_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &obic);
+                                cmd_barrier(dev, cmd, dev->overlay_img, VK_IMAGE_ASPECT_COLOR_BIT,
+                                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                                            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                                overlay_uploaded = true;
+                            }
+                        }
 
-                            cmd_barrier(dev, cmd, dev->overlay_img, VK_IMAGE_ASPECT_COLOR_BIT,
-                                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-                                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-
+                        const uint32_t bw = dev->overlay_w;
+                        const uint32_t bh = dev->overlay_h;
+                        if ((overlay_uploaded || dev->overlay_initialized) && bw <= w && bh <= h) {
                             cmd_barrier(dev, cmd, swap_img, VK_IMAGE_ASPECT_COLOR_BIT,
                                         swap_layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                         VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -1160,16 +1510,17 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_vkQueuePresentKHR(VkQueue queue, const VkPre
                     si.commandBufferCount = 1;
                     si.pCommandBuffers = &cmd;
                     si.signalSemaphoreCount = 1;
-                    si.pSignalSemaphores = &dev->overlay_sem;
+                    si.pSignalSemaphores = &present_ready;
 
-                    if (dev->QueueSubmit(queue, 1, &si, dev->fences[write_slot]) == VK_SUCCESS) {
-                        if (!capture_now) {
-                            // If not capturing, wait on overlay fence next time this slot is used
-                            dev->WaitForFences(dev->device, 1, &dev->fences[write_slot], VK_TRUE, UINT64_MAX);
-                        }
+                    if (dev->ResetFences(dev->device, 1, &dev->fences[write_slot]) == VK_SUCCESS &&
+                        dev->QueueSubmit(queue, 1, &si, dev->fences[write_slot]) == VK_SUCCESS) {
+                        if (!queued_capture) dev->slots.slots[write_slot].pending = false;
+                        if (overlay_uploaded) dev->overlay_initialized = true;
                         modified_present.waitSemaphoreCount = 1;
-                        modified_present.pWaitSemaphores = &dev->overlay_sem;
+                        modified_present.pWaitSemaphores = &present_ready;
                         submitted_internal = true;
+                    } else if (queued_capture) {
+                        dev->slots.slots[write_slot].pending = false;
                     }
                 }
 
@@ -1184,6 +1535,26 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_vkQueuePresentKHR(VkQueue queue, const VkPre
 }
 
 // --- Instance & Device Lifecycle ---
+
+VKAPI_ATTR VkResult VKAPI_CALL hook_vkCreateWin32SurfaceKHR(
+    VkInstance instance, const VkWin32SurfaceCreateInfoKHR* info,
+    const VkAllocationCallbacks* allocator, VkSurfaceKHR* surface) {
+    std::lock_guard lock(g_mutex);
+    const auto it = g_instances.find(dispatch_key(instance));
+    if (it == g_instances.end() || !it->second->CreateWin32SurfaceKHR) return VK_ERROR_EXTENSION_NOT_PRESENT;
+    const VkResult result = it->second->CreateWin32SurfaceKHR(instance, info, allocator, surface);
+    if (result == VK_SUCCESS) it->second->windows[*surface] = info->hwnd;
+    return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL hook_vkDestroySurfaceKHR(
+    VkInstance instance, VkSurfaceKHR surface, const VkAllocationCallbacks* allocator) {
+    std::lock_guard lock(g_mutex);
+    const auto it = g_instances.find(dispatch_key(instance));
+    if (it == g_instances.end() || !it->second->DestroySurfaceKHR) return;
+    it->second->windows.erase(surface);
+    it->second->DestroySurfaceKHR(instance, surface, allocator);
+}
 
 VKAPI_ATTR VkResult VKAPI_CALL hook_vkCreateInstance(
     const VkInstanceCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkInstance* pInstance) {
@@ -1209,6 +1580,8 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_vkCreateInstance(
     inst->instance = *pInstance;
     inst->next_gipa = next_gipa;
     inst->DestroyInstance = reinterpret_cast<PFN_vkDestroyInstance>(next_gipa(*pInstance, "vkDestroyInstance"));
+    inst->CreateWin32SurfaceKHR = reinterpret_cast<PFN_vkCreateWin32SurfaceKHR>(next_gipa(*pInstance, "vkCreateWin32SurfaceKHR"));
+    inst->DestroySurfaceKHR = reinterpret_cast<PFN_vkDestroySurfaceKHR>(next_gipa(*pInstance, "vkDestroySurfaceKHR"));
     inst->GetPhysicalDeviceMemoryProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(next_gipa(*pInstance, "vkGetPhysicalDeviceMemoryProperties"));
     inst->GetPhysicalDeviceQueueFamilyProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(next_gipa(*pInstance, "vkGetPhysicalDeviceQueueFamilyProperties"));
 
@@ -1294,11 +1667,13 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_vkCreateDevice(
     LOAD_DEV(EndCommandBuffer);
     LOAD_DEV(ResetCommandBuffer);
     LOAD_DEV(QueueSubmit);
+    LOAD_DEV(QueueSubmit2);
+    LOAD_DEV(QueueSubmit2KHR);
     LOAD_DEV(QueueWaitIdle);
     LOAD_DEV(DeviceWaitIdle);
     LOAD_DEV(CreateFence);
     LOAD_DEV(DestroyFence);
-    LOAD_DEV(WaitForFences);
+    LOAD_DEV(GetFenceStatus);
     LOAD_DEV(ResetFences);
     LOAD_DEV(CreateSemaphore);
     LOAD_DEV(DestroySemaphore);
@@ -1327,7 +1702,10 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_vkCreateDevice(
     LOAD_DEV(CmdBlitImage);
     LOAD_DEV(CmdClearAttachments);
     LOAD_DEV(CmdClearDepthStencilImage);
+    LOAD_DEV(CmdSetViewport);
     LOAD_DEV(CmdBeginRenderPass);
+    LOAD_DEV(CmdBeginRenderPass2);
+    LOAD_DEV(CmdBeginRenderPass2KHR);
     LOAD_DEV(CmdBeginRendering);
     LOAD_DEV(CmdBeginRenderingKHR);
     LOAD_DEV(CreateRenderPass);
@@ -1379,7 +1757,15 @@ PFN_vkVoidFunction lookup_device_proc(const char* pName) {
     if (std::strcmp(pName, "vkDestroyFramebuffer") == 0) return reinterpret_cast<PFN_vkVoidFunction>(hook_vkDestroyFramebuffer);
     if (std::strcmp(pName, "vkCreateSwapchainKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(hook_vkCreateSwapchainKHR);
     if (std::strcmp(pName, "vkDestroySwapchainKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(hook_vkDestroySwapchainKHR);
+    if (std::strcmp(pName, "vkFreeCommandBuffers") == 0) return reinterpret_cast<PFN_vkVoidFunction>(hook_vkFreeCommandBuffers);
+    if (std::strcmp(pName, "vkBeginCommandBuffer") == 0) return reinterpret_cast<PFN_vkVoidFunction>(hook_vkBeginCommandBuffer);
+    if (std::strcmp(pName, "vkQueueSubmit") == 0) return reinterpret_cast<PFN_vkVoidFunction>(hook_vkQueueSubmit);
+    if (std::strcmp(pName, "vkQueueSubmit2") == 0) return reinterpret_cast<PFN_vkVoidFunction>(hook_vkQueueSubmit2);
+    if (std::strcmp(pName, "vkQueueSubmit2KHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(hook_vkQueueSubmit2KHR);
+    if (std::strcmp(pName, "vkCmdSetViewport") == 0) return reinterpret_cast<PFN_vkVoidFunction>(hook_vkCmdSetViewport);
     if (std::strcmp(pName, "vkCmdBeginRenderPass") == 0) return reinterpret_cast<PFN_vkVoidFunction>(hook_vkCmdBeginRenderPass);
+    if (std::strcmp(pName, "vkCmdBeginRenderPass2") == 0) return reinterpret_cast<PFN_vkVoidFunction>(hook_vkCmdBeginRenderPass2);
+    if (std::strcmp(pName, "vkCmdBeginRenderPass2KHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(hook_vkCmdBeginRenderPass2KHR);
     if (std::strcmp(pName, "vkCmdBeginRendering") == 0) return reinterpret_cast<PFN_vkVoidFunction>(hook_vkCmdBeginRendering);
     if (std::strcmp(pName, "vkCmdBeginRenderingKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(hook_vkCmdBeginRenderingKHR);
     if (std::strcmp(pName, "vkCmdClearAttachments") == 0) return reinterpret_cast<PFN_vkVoidFunction>(hook_vkCmdClearAttachments);
@@ -1426,6 +1812,10 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance instan
         auto it = g_instances.find(dispatch_key(instance));
         if (it != g_instances.end()) inst = it->second.get();
     }
+    if (inst && inst->CreateWin32SurfaceKHR && std::strcmp(pName, "vkCreateWin32SurfaceKHR") == 0)
+        return reinterpret_cast<PFN_vkVoidFunction>(hook_vkCreateWin32SurfaceKHR);
+    if (inst && inst->DestroySurfaceKHR && std::strcmp(pName, "vkDestroySurfaceKHR") == 0)
+        return reinterpret_cast<PFN_vkVoidFunction>(hook_vkDestroySurfaceKHR);
     if (inst && inst->next_gipa) return inst->next_gipa(instance, pName);
     return nullptr;
 }

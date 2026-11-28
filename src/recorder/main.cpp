@@ -1,247 +1,56 @@
-#include "ui_win32.h"
+#include "recording_session.h"
 #include "injector.h"
+#include "ui_win32.h"
+
 #include <algorithm>
-#include <cstring>
+#include <cstdio>
 #include <filesystem>
-#include <mutex>
+#include <memory>
 #include <shellapi.h>
+#include <string>
 #include <thread>
-#include <vector>
-
-namespace {
-
-struct LatestFrame {
-    std::mutex mutex;
-    uint64_t frame_id = 0;
-    uint32_t width = 0;
-    uint32_t height = 0;
-    uint32_t depth_mode = 0;
-    bool has_depth = false;
-    bool color_is_rgba = false;
-    std::vector<uint8_t> color;
-    std::vector<uint8_t> depth;
-};
-
-void ring_consumer_loop(dr::RecorderAppState& app, LatestFrame& latest) {
-    while (app.running.load(std::memory_order_relaxed)) {
-        WaitForSingleObject(app.ring.event_handle(), 50);
-
-        dr::SharedConfig* cfg = app.config_view.get();
-        dr::FrameHeader hdr{};
-        while (const uint8_t* payload = app.ring.try_peek(hdr)) {
-            if (!hdr.is_preview_only && hdr.color_bytes > 0) {
-                std::lock_guard lock(latest.mutex);
-                const bool same_geom = (latest.width == hdr.width && latest.height == hdr.height &&
-                                        latest.depth_mode == hdr.depth_mode);
-                latest.width = hdr.width;
-                latest.height = hdr.height;
-                latest.depth_mode = hdr.depth_mode;
-                latest.color_is_rgba = (hdr.color_is_rgba != 0);
-                latest.color.resize(hdr.color_bytes);
-                std::memcpy(latest.color.data(), payload, hdr.color_bytes);
-
-                if (hdr.has_depth && hdr.depth_bytes > 0) {
-                    latest.depth.resize(hdr.depth_bytes);
-                    std::memcpy(latest.depth.data(), payload + hdr.color_bytes, hdr.depth_bytes);
-                    latest.has_depth = true;
-                } else if (!cfg || cfg->depth_enabled == 0 || !same_geom) {
-                    latest.has_depth = false;
-                    latest.depth.clear();
-                }
-                latest.frame_id++;
-            }
-
-            if (hdr.has_depth && hdr.depth_bytes > 0 && hdr.width > 0 && hdr.height > 0 &&
-                (hdr.is_preview_only || (hdr.frame_index % 6 == 0))) {
-                const uint8_t* d = payload + hdr.color_bytes;
-                const size_t px_count = static_cast<size_t>(hdr.width) * hdr.height;
-                std::lock_guard lock(app.preview_mutex);
-                app.preview_w = hdr.width;
-                app.preview_h = hdr.height;
-                app.preview_bgra.resize(px_count * 4);
-                if (hdr.depth_mode == static_cast<uint32_t>(dr::DepthMode::Gray8)) {
-                    for (size_t i = 0; i < px_count; ++i) {
-                        const uint8_t v = d[i];
-                        app.preview_bgra[i * 4 + 0] = v;
-                        app.preview_bgra[i * 4 + 1] = v;
-                        app.preview_bgra[i * 4 + 2] = v;
-                        app.preview_bgra[i * 4 + 3] = 255;
-                    }
-                } else {
-                    for (size_t i = 0; i < px_count; ++i) {
-                        app.preview_bgra[i * 4 + 0] = d[i * 4 + 2]; // B
-                        app.preview_bgra[i * 4 + 1] = d[i * 4 + 1]; // G
-                        app.preview_bgra[i * 4 + 2] = d[i * 4 + 0]; // R
-                        app.preview_bgra[i * 4 + 3] = 255;
-                    }
-                }
-            }
-            app.ring.release_pop();
-        }
-    }
-}
-
-void writer_loop(dr::RecorderAppState& app, LatestFrame& latest, uint64_t max_frames) {
-    LARGE_INTEGER freq_li{};
-    QueryPerformanceFrequency(&freq_li);
-    const int64_t qpc_freq = freq_li.QuadPart > 0 ? freq_li.QuadPart : 10000000LL;
-
-    uint32_t cur_w = 0, cur_h = 0, cur_mode = 999, cur_depth_en = 999, cur_fps = 0;
-    bool cur_rgba = false;
-    int64_t next_tick_qpc = 0;
-    int64_t fps_win_start_qpc = 0;
-    uint64_t fps_win_unique = 0;
-    uint64_t last_written_id = 0;
-
-    std::vector<uint8_t> color_buf;
-    std::vector<uint8_t> depth_buf;
-
-    while (app.running.load(std::memory_order_relaxed)) {
-        dr::SharedConfig* cfg = app.config_view.get();
-        const bool want_rec = (cfg && cfg->recording != 0);
-        if (!want_rec) {
-            if (app.encoder.is_running()) {
-                app.encoder.stop();
-            }
-            if (cfg) InterlockedExchange(&cfg->actual_rec_fps_x10, 0);
-            next_tick_qpc = 0;
-            fps_win_start_qpc = 0;
-            fps_win_unique = 0;
-            last_written_id = 0;
-            Sleep(10);
-            continue;
-        }
-
-        uint64_t snap_id = 0;
-        uint32_t snap_w = 0, snap_h = 0, snap_mode = 0;
-        bool snap_has_depth = false, snap_rgba = false;
-        {
-            std::lock_guard lock(latest.mutex);
-            if (latest.frame_id == 0 || latest.color.empty()) {
-                // Wait for first frame
-            } else {
-                snap_id = latest.frame_id;
-                snap_w = latest.width;
-                snap_h = latest.height;
-                snap_mode = latest.depth_mode;
-                snap_has_depth = latest.has_depth;
-                snap_rgba = latest.color_is_rgba;
-                color_buf = latest.color;
-                if (snap_has_depth && !latest.depth.empty()) {
-                    depth_buf = latest.depth;
-                } else {
-                    depth_buf.clear();
-                    snap_has_depth = false;
-                }
-            }
-        }
-
-        if (snap_id == 0 || color_buf.empty()) {
-            Sleep(2);
-            continue;
-        }
-
-        const uint32_t target_fps = std::clamp<uint32_t>(app.recording_fps ? app.recording_fps : 60, 1, 240);
-        const uint32_t depth_en_u = snap_has_depth ? 1u : 0u;
-        if (!app.encoder.is_running() ||
-            cur_w != snap_w || cur_h != snap_h ||
-            cur_mode != snap_mode || cur_depth_en != depth_en_u ||
-            cur_fps != target_fps || cur_rgba != snap_rgba) {
-            dr::EncoderSettings es{};
-            es.output_dir = app.output_dir;
-            es.depth_mode = static_cast<dr::DepthMode>(snap_mode);
-            es.depth_enabled = snap_has_depth;
-            es.fps = target_fps;
-            es.h264_quality = app.h264_quality;
-            es.color_is_rgba = snap_rgba;
-            es.extra_ffmpeg_flags = app.extra_ffmpeg_flags;
-            if (app.encoder.start(snap_w, snap_h, es)) {
-                cur_w = snap_w;
-                cur_h = snap_h;
-                cur_mode = snap_mode;
-                cur_depth_en = depth_en_u;
-                cur_fps = target_fps;
-                cur_rgba = snap_rgba;
-            }
-        }
-
-        LARGE_INTEGER now_li{};
-        QueryPerformanceCounter(&now_li);
-        if (next_tick_qpc == 0) {
-            next_tick_qpc = now_li.QuadPart;
-            fps_win_start_qpc = now_li.QuadPart;
-        }
-
-        if (app.encoder.is_running()) {
-            app.encoder.write_frame(color_buf.data(), static_cast<uint32_t>(color_buf.size()),
-                                    snap_has_depth ? depth_buf.data() : nullptr,
-                                    snap_has_depth ? static_cast<uint32_t>(depth_buf.size()) : 0u);
-            if (snap_id != last_written_id) {
-                fps_win_unique++;
-                last_written_id = snap_id;
-            }
-            QueryPerformanceCounter(&now_li);
-            const double win_sec = static_cast<double>(now_li.QuadPart - fps_win_start_qpc) / static_cast<double>(qpc_freq);
-            if (win_sec >= 0.25 && cfg) {
-                const double actual = static_cast<double>(fps_win_unique) / win_sec;
-                InterlockedExchange(&cfg->actual_rec_fps_x10, static_cast<LONG>(actual * 10.0));
-                fps_win_start_qpc = now_li.QuadPart;
-                fps_win_unique = 0;
-            }
-        }
-
-        if (max_frames > 0 && app.encoder.frames_written() >= max_frames) {
-            if (cfg) InterlockedExchange(&cfg->recording, 0);
-            app.encoder.stop();
-            app.running.store(false);
-            break;
-        }
-
-        const int64_t period_qpc = qpc_freq / static_cast<int64_t>(target_fps);
-        next_tick_qpc += period_qpc;
-        QueryPerformanceCounter(&now_li);
-        if (now_li.QuadPart - next_tick_qpc > qpc_freq / 2) {
-            next_tick_qpc = now_li.QuadPart;
-        }
-        while (app.running.load(std::memory_order_relaxed)) {
-            QueryPerformanceCounter(&now_li);
-            const int64_t rem_qpc = next_tick_qpc - now_li.QuadPart;
-            if (rem_qpc <= 0) break;
-            const double rem_ms = (static_cast<double>(rem_qpc) * 1000.0) / static_cast<double>(qpc_freq);
-            if (rem_ms > 2.0) {
-                Sleep(static_cast<DWORD>(rem_ms - 1.0));
-            } else {
-                YieldProcessor();
-            }
-        }
-    }
-    app.encoder.stop();
-}
-
-} // namespace
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
+    struct HandleCloser {
+        void operator()(void* handle) const { if (handle) CloseHandle(handle); }
+    };
+    const std::unique_ptr<void, HandleCloser> instance(CreateMutexW(nullptr, TRUE, LR"(Local\DepthRecorderInstance)"));
+    if (!instance || GetLastError() == ERROR_ALREADY_EXISTS) {
+        MessageBoxW(nullptr, L"Depth Recorder is already open.", L"Depth Recorder", MB_ICONERROR);
+        return 1;
+    }
+
     dr::RecorderAppState app;
     if (!app.config_view.open_or_create(true) || !app.ring.open_or_create(true)) {
         MessageBoxW(nullptr, L"Failed to initialize shared memory IPC.", L"Depth Recorder", MB_ICONERROR);
         return 1;
     }
+    *app.config_view.get() = dr::SharedConfig{};
+    app.config_view.get()->target_pid = -1;
     app.ring.reset_indices();
 
     wchar_t exe_path[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
-    app.hook_dll_path = (std::filesystem::path(exe_path).parent_path() / L"depth_hook.dll").wstring();
+    const auto exe_dir = std::filesystem::path(exe_path).parent_path();
+    app.hook_dll_path = (exe_dir / L"depth_hook.dll").wstring();
+    app.output_dir = (exe_dir / L"recordings").wstring();
+    app.log.init((exe_dir / L"depth_recorder.log").wstring());
 
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
 
     std::wstring cli_launch;
     uint64_t cli_frames = 0;
+    DWORD attach_pid = 0;
+    bool warmup_encoder = false;
     bool cli_mode = false;
     for (int i = 1; i < argc; ++i) {
         std::wstring arg = argv[i];
         if (arg == L"--launch" && i + 1 < argc) {
             cli_launch = argv[++i];
+            cli_mode = true;
+        } else if (arg == L"--attach" && i + 1 < argc) {
+            attach_pid = std::wcstoul(argv[++i], nullptr, 10);
             cli_mode = true;
         } else if (arg == L"--out" && i + 1 < argc) {
             app.output_dir = argv[++i];
@@ -253,57 +62,143 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
             if (m == L"gray8") cfg->depth_mode = static_cast<LONG>(dr::DepthMode::Gray8);
             else if (m == L"color_phase") cfg->depth_mode = static_cast<LONG>(dr::DepthMode::ColorPhase);
             else cfg->depth_mode = static_cast<LONG>(dr::DepthMode::Rgb24Lossless);
+        } else if (arg == L"--discard") {
+            app.discard_output = true;
+        } else if (arg == L"--software-encoder") {
+            app.software_encoder = true;
+        } else if (arg == L"--warmup-encoder") {
+            warmup_encoder = true;
         } else if (arg == L"--no-depth") {
             app.config_view.get()->depth_enabled = 0;
+        } else if (arg == L"--no-linearize") {
+            app.config_view.get()->linearize = 0;
+        } else if (arg == L"--overlay") {
+            app.config_view.get()->overlay_enabled = 1;
         } else if (arg == L"--no-overlay") {
             app.config_view.get()->overlay_enabled = 0;
+        } else if (arg == L"--drop-dead-frames") {
+            app.drop_dead_frames = true;
+        } else if (arg == L"--extra-ffmpeg" && i + 1 < argc) {
+            app.extra_ffmpeg_flags = argv[++i];
         } else if (arg == L"--fps" && i + 1 < argc) {
             const uint32_t f = static_cast<uint32_t>(std::wcstoul(argv[++i], nullptr, 10));
-            if (f >= 1 && f <= 240) app.recording_fps = f;
+            if (f >= 1 && f <= 240) {
+                app.recording_fps = f;
+                app.config_view.get()->target_rec_fps = static_cast<LONG>(f);
+            }
         }
     }
     if (argv) LocalFree(argv);
 
-    LatestFrame latest;
+    dr::FrameInbox inbox;
 
     if (cli_mode) {
+        auto* cfg = app.config_view.get();
         if (cli_frames == 0) cli_frames = 60;
-        app.config_view.get()->recording = 1;
-        std::thread consumer(ring_consumer_loop, std::ref(app), std::ref(latest));
-        std::thread writer(writer_loop, std::ref(app), std::ref(latest), cli_frames);
+        warmup_encoder = warmup_encoder && !app.discard_output;
+        ULONGLONG warmup_ms = 0;
         DWORD pid = 0;
-        const bool launched = dr::launch_and_inject(cli_launch, app.hook_dll_path, pid);
-        if (!launched) {
+        if (attach_pid) {
+            InterlockedExchange(&cfg->target_pid, static_cast<LONG>(attach_pid));
+            InterlockedExchange(&cfg->selected_swapchain_index, -1);
+            cfg->preview_enabled = warmup_encoder ? 1 : 0;
+            if (!dr::inject_dll(attach_pid, app.hook_dll_path)) return 2;
+            const ULONGLONG deadline = GetTickCount64() + 5000;
+            while (!cfg->swapchain_count && GetTickCount64() < deadline) Sleep(20);
+            Sleep(300);
+            const LONG selected = dr::largest_swapchain_index(*cfg);
+            if (selected < 0) {
+                InterlockedExchange(&cfg->target_pid, -1);
+                InterlockedIncrement(&cfg->unload_seq);
+                return 2;
+            }
+            InterlockedExchange(&cfg->selected_swapchain_index, selected);
+        } else {
+            if (cli_launch.empty()) return 2;
+            InterlockedExchange(&cfg->target_pid, 0);
+        }
+
+        if (!warmup_encoder) dr::start_recording(app, false);
+        std::thread consumer(dr::ring_consumer_loop, std::ref(app), std::ref(inbox));
+        std::thread writer(dr::writer_loop, std::ref(app), std::ref(inbox), cli_frames);
+        if (!attach_pid && !dr::launch_and_inject(cli_launch, app.hook_dll_path, pid)) {
             app.running.store(false);
             writer.join();
             consumer.join();
             return 2;
         }
-        // Wait up to 20s for N frames to be recorded
-        for (int t = 0; t < 400 && app.running.load(); ++t) {
-            Sleep(50);
+        bool started = !warmup_encoder;
+        if (warmup_encoder) {
+            const auto began = GetTickCount64();
+            while (GetTickCount64() - began < 20000 && app.encoder_failed_generation != cfg->capture_generation) {
+                if ((started = dr::start_recording(app, true))) break;
+                Sleep(20);
+            }
+            warmup_ms = GetTickCount64() - began;
+            if (!started) dr::finish_recording(app, inbox, false, L"The target did not supply a usable profile during encoder warmup.");
         }
+        const uint64_t timeout_ticks = 400 + (cli_frames / app.recording_fps + 1) * 20;
+        for (uint64_t t = 0; started && t < timeout_ticks && app.running.load(); ++t) Sleep(50);
+        dr::stop_recording(app);
         app.running.store(false);
         writer.join();
         consumer.join();
-        if (HANDLE proc = OpenProcess(PROCESS_TERMINATE, FALSE, pid)) {
+
+        if (const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE); output && output != INVALID_HANDLE_VALUE) {
+            char stats[512]{};
+            const LONG selected = cfg->selected_swapchain_index;
+            dr::SwapchainInfo viewport{};
+            dr::read_swapchain_info(cfg, selected, viewport);
+            const int length = snprintf(stats, sizeof(stats),
+                "backend=%ld viewport=%ux%u candidates=%ld dropped=%ld present_fps=%.1f presents=%ld published=%ld received=%llu written=%llu unique=%llu warmup_ms=%llu inbox_full=%llu\n",
+                cfg->active_backend, viewport.width, viewport.height, cfg->candidate_depth_count, cfg->dropped_frames,
+                cfg->current_fps_x10 / 10.0, cfg->presented_frames, cfg->published_pairs,
+                static_cast<unsigned long long>(app.received_pairs.load()),
+                static_cast<unsigned long long>(app.written_pairs.load()),
+                static_cast<unsigned long long>(app.unique_written_pairs.load()),
+                static_cast<unsigned long long>(warmup_ms),
+                static_cast<unsigned long long>(app.inbox_full_pairs.load()));
+            DWORD written = 0;
+            if (length > 0 && static_cast<size_t>(length) < sizeof(stats)) WriteFile(output, stats, static_cast<DWORD>(length), &written, nullptr);
+            if (!app.recording.message.empty()) {
+                const std::wstring message = app.recording.message + L"\n";
+                const int bytes = WideCharToMultiByte(CP_UTF8, 0, message.data(), static_cast<int>(message.size()),
+                                                      nullptr, 0, nullptr, nullptr);
+                if (bytes > 0) {
+                    std::string utf8(static_cast<size_t>(bytes), '\0');
+                    if (WideCharToMultiByte(CP_UTF8, 0, message.data(), static_cast<int>(message.size()),
+                                           utf8.data(), bytes, nullptr, nullptr)) {
+                        WriteFile(output, utf8.data(), static_cast<DWORD>(bytes), &written, nullptr);
+                    }
+                }
+            }
+        }
+        if (attach_pid) {
+            InterlockedExchange(&cfg->target_pid, -1);
+            InterlockedIncrement(&cfg->unload_seq);
+            Sleep(300);
+        } else if (HANDLE proc = OpenProcess(PROCESS_TERMINATE, FALSE, pid)) {
             TerminateProcess(proc, 0);
             CloseHandle(proc);
         }
-        return (app.encoder.frames_written() >= cli_frames) ? 0 : 3;
+        return (app.recording.status == dr::RecordingStatus::Saved &&
+                (app.drop_dead_frames || app.written_pairs >= cli_frames)) ? 0 : 3;
     }
 
-    std::thread consumer(ring_consumer_loop, std::ref(app), std::ref(latest));
-    std::thread writer(writer_loop, std::ref(app), std::ref(latest), 0);
+    std::thread consumer(dr::ring_consumer_loop, std::ref(app), std::ref(inbox));
+    std::thread writer(dr::writer_loop, std::ref(app), std::ref(inbox), 0);
     const int rc = dr::run_win32_ui(hInstance, app);
+    dr::stop_recording(app);
     if (auto* cfg = app.config_view.get()) {
         InterlockedExchange(&cfg->recording, 0);
         InterlockedExchange(&cfg->preview_enabled, 0);
-        InterlockedIncrement(&cfg->unload_seq);
-        Sleep(150);
     }
     app.running.store(false);
     writer.join();
     consumer.join();
+    if (auto* cfg = app.config_view.get()) {
+        InterlockedIncrement(&cfg->unload_seq);
+        Sleep(150);
+    }
     return rc;
 }
