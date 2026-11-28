@@ -2,6 +2,8 @@
 
 records a color and depth pass simultaneously for graphical applications. similar to fraps/dxtory, but primarily intended for depth maps.
 
+![assaultcube_example](assets/assaultcube_example.png)
+
 ## Get Started
 
 1. Download and extract a portable .zip from [releases](https://github.com/xa1on/depth_recorder/releases/) and run `depth_recorder.exe`.
