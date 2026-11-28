@@ -8,10 +8,12 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
 
 function Write-ReleaseZip([string]$Directory, [string]$Destination) {
+    $dirPrefixLen = $Directory.TrimEnd('\','/').Length + 1
     [string[]]$files = Get-ChildItem -LiteralPath $Directory -Recurse -File -Force |
-        ForEach-Object { [IO.Path]::GetRelativePath($Directory, $_.FullName) }
+        ForEach-Object { $_.FullName.Substring($dirPrefixLen) }
     [Array]::Sort($files, [StringComparer]::Ordinal)
     $base = Split-Path -Leaf $Directory
     $epoch = [DateTimeOffset]::new(1980, 1, 1, 0, 0, 0, [TimeSpan]::Zero)
@@ -29,7 +31,7 @@ function Write-ReleaseZip([string]$Directory, [string]$Destination) {
                 } finally { $inputStream.Dispose() }
             }
         } finally { $zip.Dispose() }
-        [IO.File]::Move($temporary, $Destination, $true)
+        Move-Item -LiteralPath $temporary -Destination $Destination -Force
     } finally {
         if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) }
     }
@@ -52,9 +54,9 @@ try {
         throw 'FFmpeg must use the redistributable GPL build from tools/build-ffmpeg.sh.'
     }
     $encoders = & $ffmpeg -hide_banner -encoders 2>&1 | Out-String
-    if ($LASTEXITCODE -ne 0 -or $encoders -notmatch '\blibx264\b' -or $encoders -notmatch '\butvideo\b' -or
-        $encoders -notmatch '\bh264_amf\b') {
-        throw 'The package requires AMD AMF, the x264 software fallback, and UtVideo.'
+    $hasAmf = ($encoders -match '\bh264_amf\b')
+    if ($LASTEXITCODE -ne 0 -or $encoders -notmatch '\blibx264\b' -or $encoders -notmatch '\butvideo\b') {
+        throw 'The package requires the x264 software fallback and UtVideo.'
     }
     $gpuInclude = Select-String -LiteralPath (Join-Path $x64 'CMakeCache.txt') -Pattern '^DEPTH_RECORDER_NVENC_INCLUDE:PATH=.+$' -Quiet
     if ($gpuInclude) {
@@ -63,7 +65,9 @@ try {
             throw 'GPU recording requires the H.264 demuxer from the current tools/build-ffmpeg.sh.'
         }
     }
-    foreach ($component in 'ffmpeg', 'x264', 'nv-codec-headers', 'amf') {
+    $requiredComponents = @('ffmpeg', 'x264', 'nv-codec-headers')
+    if ($hasAmf) { $requiredComponents += 'amf' }
+    foreach ($component in $requiredComponents) {
         if (!(Test-Path -LiteralPath (Join-Path $encoder "source/$component.tar.gz") -PathType Leaf)) {
             throw "Corresponding source for $component is missing."
         }
@@ -98,7 +102,9 @@ try {
     Copy-Item -LiteralPath $ffmpeg -Destination $portable
     Copy-Item -LiteralPath 'LICENSE','README.md' -Destination $portable
     Copy-Item -LiteralPath (Join-Path $minhook 'LICENSE.txt') -Destination (Join-Path $licenses 'MinHook.txt')
-    foreach ($name in 'FFmpeg-GPL-2.0.txt','x264-license.txt','AMF-license.txt','nv-codec-headers') {
+    $licenseNames = @('FFmpeg-GPL-2.0.txt','x264-license.txt','nv-codec-headers')
+    if ($hasAmf) { $licenseNames += 'AMF-license.txt' }
+    foreach ($name in $licenseNames) {
         Copy-Item -LiteralPath (Join-Path $encoder $name) -Destination $licenses -Recurse
     }
 
